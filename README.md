@@ -19,6 +19,8 @@ stay-awake while-command 'who | grep -q pts'   # while any condition holds
 The bar widget shows what is holding the machine and how long is left. Every
 hold ends with a notification saying why.
 
+![The bar widget and its panel, holding two sessions](preview.png)
+
 ## Install
 
 ```bash
@@ -34,6 +36,27 @@ For the command line, put its `bin` on your `PATH`:
 ```bash
 ln -s ~/.config/omarchy/plugins/ignibyte.stay-awake-sessions/bin/stay-awake ~/.local/bin/stay-awake
 ```
+
+### Removal
+
+```bash
+omarchy plugin disable ignibyte.stay-awake-sessions
+omarchy plugin remove ignibyte.stay-awake-sessions
+rm -f ~/.local/bin/stay-awake
+rm -rf ~/.local/state/omarchy/stay-awake-sessions
+```
+
+Disabling releases any hold the plugin is keeping, so the machine goes back to
+its usual timers. Nothing outside those paths is touched: the plugin writes only
+its own state directory and the Stay Awake flag Omarchy already owns, and it
+adds one entry to `~/.config/omarchy/shell.json`, which `omarchy plugin remove`
+takes back out.
+
+### Requirements
+
+Omarchy 4 (Quattro). Beyond what Omarchy already installs, it uses `bash`,
+`pgrep` (procps-ng), `systemd-inhibit` and `notify-send` (libnotify) — all
+present on a stock Omarchy box. The CLI wrapper also uses `jq`.
 
 ## The bar widget
 
