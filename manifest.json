@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ignibyte.stay-awake-sessions",
   "name": "Stay Awake Sessions",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "author": "Ignibyte",
   "description": "Hold the machine awake for a reason that ends by itself: a deadline, a running process, or any condition you can write as a command.",
   "homepage": "https://github.com/Ignibyte/omarchy-stay-awake-sessions",
@@ -28,7 +28,12 @@
       "pollSeconds": 5,
       "graceSeconds": 15,
       "notify": true,
-      "showWhenIdle": true
+      "showWhenIdle": true,
+      "quickMinutes": "5, 15, 30",
+      "quickHours": "1, 2, 4",
+      "showCountdown": true,
+      "notifyOnStart": false,
+      "icon": "󰅶"
     },
     "schema": [
       {
@@ -42,10 +47,28 @@
         "description": "How long the one-click hold lasts."
       },
       {
+        "key": "quickMinutes",
+        "type": "string",
+        "label": "Quick holds, in minutes",
+        "defaultValue": "5, 15, 30",
+        "description": "Up to six, comma separated. One button each in the panel."
+      },
+      {
+        "key": "quickHours",
+        "type": "string",
+        "label": "Quick holds, in hours",
+        "defaultValue": "1, 2, 4",
+        "description": "Up to six, comma separated. One button each in the panel."
+      },
+      {
         "key": "defaultScope",
         "type": "enum",
         "label": "What a hold blocks",
-        "options": ["idle", "sleep", "all"],
+        "options": [
+          "idle",
+          "sleep",
+          "all"
+        ],
         "defaultValue": "idle",
         "description": "idle: screensaver and lock. sleep: suspend. all: both."
       },
@@ -80,6 +103,27 @@
         "type": "boolean",
         "label": "Keep the icon in the bar when nothing holds",
         "defaultValue": true
+      },
+      {
+        "key": "showCountdown",
+        "type": "boolean",
+        "label": "Show the time left in the bar",
+        "defaultValue": true,
+        "description": "Off leaves just the icon, lit while something is held."
+      },
+      {
+        "key": "notifyOnStart",
+        "type": "boolean",
+        "label": "Notify when a hold starts",
+        "defaultValue": false,
+        "description": "Holds always notify when they end; this adds the other half."
+      },
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Bar icon",
+        "defaultValue": "6",
+        "description": "The glyph in the bar. Any character your bar font has."
       }
     ]
   }

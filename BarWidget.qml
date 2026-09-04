@@ -24,16 +24,35 @@ BarWidget {
   readonly property var rows: SessionModel.publicSessions(heldSessions, nowMs)
   readonly property bool showWhenIdle: setting("showWhenIdle", true) !== false
   readonly property bool screensaverOff: service ? service.standingScreensaverOff : false
+  readonly property var quickMinutes: service ? service.quickMinutes : [5, 15, 30]
+  readonly property var quickHours: service ? service.quickHours : [1, 2, 4]
+
+  // Read when the panel opens rather than bound: a picker only has to be right
+  // at the moment it is looked at, and this keeps the widget off the
+  // compositor's toplevel signals.
+  property var appOptions: []
+
+  function refreshApps() {
+    root.appOptions = service ? service.openApps() : []
+  }
+
   readonly property int defaultMinutes: service ? service.defaultMinutes : 60
 
   property bool opened: false
 
-  readonly property string glyph: "󰅶"
+  readonly property string glyph: String(setting("icon", "󰅶")) || "󰅶"
+  readonly property bool showCountdown: setting("showCountdown", true) !== false
 
   // Shape contract for the shell's summon/hide/toggle routing.
-  function open() { root.opened = true }
+  function open() {
+    root.refreshApps()
+    root.opened = true
+  }
   function close() { root.opened = false }
-  function togglePopup() { root.opened = !root.opened }
+  function togglePopup() {
+    if (!root.opened) root.refreshApps()
+    root.opened = !root.opened
+  }
 
   function hold(spec) {
     if (service) service.start(spec)
@@ -51,7 +70,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.holding && root.countdown !== "" ? root.glyph + "  " + root.countdown : root.glyph
+    text: root.holding && root.showCountdown && root.countdown !== ""
+      ? root.glyph + "  " + root.countdown : root.glyph
     fontSize: Style.font.caption
     dimmed: !root.holding
     active: root.holding
@@ -207,36 +227,144 @@ BarWidget {
 
       PanelSeparator { }
 
+      // Two rows because minutes and hours are two different intentions, and
+      // both lists come from settings — everyone's idea of a short hold differs.
       Row {
+        width: content.width
         spacing: Style.spacing.sm
 
-        Button {
-          text: "15m"
-          bordered: true
-          fontSize: Style.font.caption
-          onClicked: root.hold("for=15m")
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(52)
+          textFormat: Text.PlainText
+          text: "Minutes"
+          color: Qt.darker(Color.popups.text, 1.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: root.quickMinutes
+
+          Button {
+            required property var modelData
+            text: modelData + "m"
+            bordered: true
+            fontSize: Style.font.caption
+            onClicked: root.hold("for=" + modelData + "m")
+          }
+        }
+      }
+
+      Row {
+        width: content.width
+        spacing: Style.spacing.sm
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(52)
+          textFormat: Text.PlainText
+          text: "Hours"
+          color: Qt.darker(Color.popups.text, 1.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: root.quickHours
+
+          Button {
+            required property var modelData
+            text: modelData + "h"
+            bordered: true
+            fontSize: Style.font.caption
+            onClicked: root.hold("for=" + modelData + "h")
+          }
+        }
+      }
+
+      // Anything the buttons do not cover, typed: a duration or a time of day.
+      Row {
+        width: content.width
+        spacing: Style.spacing.sm
+
+        TextField {
+          id: customDuration
+          width: content.width - customButton.width - untilStopButton.width - Style.spacing.sm * 2
+          placeholderText: "90m, 1h30m, 17:00 or 5pm"
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          onAccepted: customButton.submit()
         }
 
         Button {
-          text: "1h"
+          id: customButton
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Hold"
           bordered: true
           fontSize: Style.font.caption
-          onClicked: root.hold("for=1h")
+
+          // A colon or an am/pm means a time of day; anything else is a
+          // duration. Both go through the same parser the CLI uses.
+          function submit() {
+            var typed = String(customDuration.text).trim()
+            if (typed === "") return
+            var isClock = typed.indexOf(":") !== -1 || /(am|pm)$/i.test(typed)
+            root.hold((isClock ? "until=" : "for=") + typed)
+            customDuration.text = ""
+          }
+
+          onClicked: submit()
         }
 
         Button {
-          text: "3h"
-          bordered: true
-          fontSize: Style.font.caption
-          onClicked: root.hold("for=3h")
-        }
-
-        Button {
-          text: "Until I stop"
+          id: untilStopButton
+          anchors.verticalCenter: parent.verticalCenter
+          text: "No end"
+          tooltipText: "Hold until you stop it"
           bordered: true
           fontSize: Style.font.caption
           onClicked: root.hold("label=Until you stop it")
         }
+      }
+
+      PanelSeparator { }
+
+      PanelSectionHeader { text: "WHILE AN APP IS OPEN" }
+
+      // Inline rather than a dropdown: a dropdown's list is laid out inside
+      // this popup window, which is sized to exactly fit its content, so the
+      // list had nowhere to go and was cut off at the bottom. Buttons that
+      // wrap make the card grow instead, and match the quick holds above.
+      Flow {
+        width: content.width
+        spacing: Style.spacing.sm
+
+        Repeater {
+          model: root.appOptions
+
+          Button {
+            required property var modelData
+            text: SessionModel.shortAppLabel(modelData.appId)
+            tooltipText: modelData.title === ""
+              ? modelData.appId : modelData.appId + " — " + modelData.title
+            bordered: true
+            fontSize: Style.font.caption
+            onClicked: root.hold("while-app=" + modelData.appId
+              + ' label="' + SessionModel.shortAppLabel(modelData.appId) + '"')
+          }
+        }
+      }
+
+      Text {
+        visible: root.appOptions.length === 0
+        width: parent.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: "No windows are open to watch."
+        color: Qt.darker(Color.popups.text, 1.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
       }
 
       Button {

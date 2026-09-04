@@ -7,7 +7,7 @@
 // screensaver by holding the Stay Awake flag, so folding it in would raise the
 // screensaver timeout in shell.json for no gain.
 var LEVERS = { idle: ["idle", "all"], sleep: ["sleep", "all"], screen: ["screen"] }
-var KINDS = ["timed", "process", "command", "manual"]
+var KINDS = ["timed", "process", "command", "app", "manual"]
 
 function clampInt(value, min, max, fallback) {
   var n = Number(value)
@@ -34,12 +34,20 @@ function parseDurationMs(text) {
   return ((hours * 3600) + (minutes * 60) + seconds) * 1000
 }
 
-// "17:00" means the next 17:00, today if it has not passed yet.
+// "17:00", "5pm" and "5:30 pm" all mean the next time it is that o'clock,
+// today if it has not passed yet.
 function parseClockMs(text, nowMs) {
-  var match = String(text || "").trim().match(/^(\d{1,2}):(\d{2})$/)
-  if (!match) return 0
+  var raw = String(text || "").trim().toLowerCase().replace(/\s+/g, "")
+  var match = raw.match(/^(\d{1,2})(?::(\d{2}))?(am|pm)?$/)
+  if (!match || (match[2] === undefined && match[3] === undefined)) return 0
   var hours = parseInt(match[1], 10)
-  var minutes = parseInt(match[2], 10)
+  var minutes = parseInt(match[2] || "0", 10)
+  var meridiem = match[3]
+  if (meridiem) {
+    if (hours < 1 || hours > 12) return 0
+    if (meridiem === "pm" && hours !== 12) hours += 12
+    if (meridiem === "am" && hours === 12) hours = 0
+  }
   if (hours > 23 || minutes > 59) return 0
   var target = new Date(nowMs)
   target.setHours(hours, minutes, 0, 0)
@@ -71,6 +79,20 @@ function formatElapsed(ms) {
   if (hours > 0) return hours + "h " + pad2(minutes) + "m"
   if (minutes > 0) return minutes + "m"
   return total + "s"
+}
+
+// "5, 15, 30" or "5 15 30" — a settings field a person can type into, rather
+// than a schema type the settings form does not have.
+function parseNumberList(text, fallback, min, max, limit) {
+  var parts = String(text === undefined || text === null ? "" : text).split(/[\s,]+/)
+  var out = []
+  for (var i = 0; i < parts.length && out.length < limit; i++) {
+    if (parts[i] === "") continue
+    var n = Math.round(Number(parts[i]))
+    if (!isFinite(n) || n < min || n > max) continue
+    if (out.indexOf(n) === -1) out.push(n)
+  }
+  return out.length > 0 ? out : fallback
 }
 
 function normalizeScope(value, fallback) {
@@ -154,6 +176,7 @@ function buildSession(spec, defaults, nowMs, id) {
     expiresAt: 0,
     pattern: "",
     command: "",
+    app: "",
     graceSeconds: grace === "" ? defaults.graceSeconds : clampInt(grace, 0, 600, defaults.graceSeconds)
   }
 
@@ -173,10 +196,18 @@ function buildSession(spec, defaults, nowMs, id) {
 
   if (untilText !== "") {
     var at = parseClockMs(untilText, nowMs)
-    if (at <= 0) return { error: "could not read a time from '" + untilText + "' (expected HH:MM)" }
+    if (at <= 0) return { error: "could not read a time from '" + untilText + "' (expected 17:00, 5pm or 5:30pm)" }
     session.kind = "timed"
     session.expiresAt = at
     session.label = label || "Until " + formatClock(at)
+    return session
+  }
+
+  var appText = specValue(spec, ["while-app", "app", "whileapp"])
+  if (appText !== "") {
+    session.kind = "app"
+    session.app = appText
+    session.label = label || appText
     return session
   }
 
@@ -202,18 +233,38 @@ function buildSession(spec, defaults, nowMs, id) {
 function describe(session) {
   if (!session) return ""
   if (session.kind === "timed") return "until " + formatClock(session.expiresAt)
+  if (session.kind === "app") return "while " + session.app + " is open"
   if (session.kind === "process") return "while " + session.pattern + " is running"
   if (session.kind === "command") return "while the condition holds"
   return "until you stop it"
 }
 
+// Watched = has a condition that has to be re-checked. App windows are read
+// straight off the compositor's toplevel list in QML; processes and commands
+// need a shell, and only those go to the evaluator.
 function isWatched(session) {
+  return session && (session.kind === "process" || session.kind === "command" || session.kind === "app")
+}
+
+function isShellWatched(session) {
   return session && (session.kind === "process" || session.kind === "command")
+}
+
+// Match an open window against what the user asked for: the app id first, then
+// its title, both case-insensitively, so "mpv", "MPV" and a title fragment all
+// find the same window.
+function matchesApp(appId, title, pattern) {
+  var needle = String(pattern || "").trim().toLowerCase()
+  if (needle === "") return false
+  var id = String(appId || "").toLowerCase()
+  if (id === needle) return true
+  if (id.indexOf(needle) !== -1) return true
+  return String(title || "").toLowerCase().indexOf(needle) !== -1
 }
 
 function watched(sessions) {
   var out = []
-  for (var i = 0; i < sessions.length; i++) if (isWatched(sessions[i])) out.push(sessions[i])
+  for (var i = 0; i < sessions.length; i++) if (isShellWatched(sessions[i])) out.push(sessions[i])
   return out
 }
 
@@ -280,6 +331,35 @@ function barLabel(sessions, nowMs) {
   return sessions.length + "×"
 }
 
+// App ids are not written for people: "chrome-teams.microsoft.com__-Profile_1"
+// and "com.ignibyte.rusty" both need trimming before they fit on a button. The
+// full id and window title go in the tooltip, so nothing is lost.
+function shortAppLabel(appId) {
+  var id = String(appId || "").trim()
+  if (id === "") return ""
+
+  // A site-specific browser window: the profile suffix says nothing useful.
+  if (id.indexOf("chrome-") === 0) {
+    id = id.slice(7)
+    var cut = id.indexOf("__")
+    if (cut > 0) id = id.slice(0, cut)
+  }
+
+  // A reverse-DNS app id ends with the part a person says out loud, so
+  // com.ignibyte.rusty is "rusty". A plain domain is the other way round, and
+  // the same rule would turn teams.microsoft.com into "com" — so only strip
+  // when the id *starts* with something that looks like a TLD.
+  if (/^(com|org|net|io|dev|app|me|edu|gov|xyz|moe|re|fr|de|eu|uk|ca|nl|se|it|es|in|page|sh|gg)\./i.test(id)) {
+    var parts = id.split(".")
+    var last = parts[parts.length - 1]
+    if (last.length > 1) id = last
+  } else {
+    id = id.replace(/^www\./i, "")
+  }
+
+  return id.length > 16 ? id.slice(0, 15) + "…" : id
+}
+
 function shortLabel(text) {
   var s = String(text || "").trim()
   return s.length > 14 ? s.slice(0, 13) + "…" : s
@@ -337,6 +417,7 @@ function publicSession(session, nowMs) {
     remainingMs: remainingMs(session, nowMs),
     pattern: session.pattern,
     command: session.command,
+    app: session.app,
     graceSeconds: session.graceSeconds
   }
 }

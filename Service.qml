@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import "SessionModel.js" as SessionModel
 
 // The session engine. Holds a list of reasons the machine should stay awake,
@@ -36,6 +37,9 @@ Item {
   readonly property int pollSeconds: SessionModel.clampInt(config.pollSeconds, 1, 300, 5)
   readonly property int graceSeconds: SessionModel.clampInt(config.graceSeconds, 0, 600, 15)
   readonly property bool notifyOnEnd: config.notify !== false
+  readonly property bool notifyOnStart: config.notifyOnStart === true
+  readonly property var quickMinutes: SessionModel.parseNumberList(config.quickMinutes, [5, 15, 30], 1, 1440, 6)
+  readonly property var quickHours: SessionModel.parseNumberList(config.quickHours, [1, 2, 4], 1, 24, 6)
 
   readonly property var idleConfig: shell && shell.shellConfig && shell.shellConfig.idle
     ? shell.shellConfig.idle : ({})
@@ -102,6 +106,9 @@ Item {
     sessions = next
     log("hold " + session.id + " " + session.label + " (" + SessionModel.describe(session)
       + ", blocks " + SessionModel.scopeLabel(session.scope) + ")")
+    if (root.notifyOnStart)
+      notify(session.label + " — holding", "Blocks " + SessionModel.scopeLabel(session.scope)
+        + " " + SessionModel.describe(session) + ".")
     // A condition may already be false at this moment (the process has not
     // started yet); the grace period covers that, so nothing is checked here.
     return session.id
@@ -395,6 +402,51 @@ Item {
     }
   }
 
+  // ------------------------------------------------------------- open windows
+
+  // The compositor's own toplevel list, which is live and needs no subprocess.
+  // Amphetamine's "while this app is running" is this list plus a match.
+  function openApps() {
+    var out = []
+    var seen = ({})
+    try {
+      var values = ToplevelManager.toplevels.values
+      for (var i = 0; i < values.length; i++) {
+        var top = values[i]
+        if (!top) continue
+        var appId = String(top.appId || "")
+        if (appId === "" || seen[appId]) continue
+        seen[appId] = true
+        out.push({ appId: appId, title: String(top.title || "") })
+      }
+    } catch (error) {
+      root.log("could not read the window list: " + error)
+    }
+    out.sort(function(left, right) { return left.appId.localeCompare(right.appId) })
+    return out
+  }
+
+  function appIsOpen(pattern) {
+    try {
+      var values = ToplevelManager.toplevels.values
+      for (var i = 0; i < values.length; i++) {
+        var top = values[i]
+        if (top && SessionModel.matchesApp(top.appId, top.title, pattern)) return true
+      }
+    } catch (error) {
+      // A compositor without the toplevel protocol: hold rather than drop it.
+      return true
+    }
+    return false
+  }
+
+  // A window closing should end its hold promptly, not at the next poll.
+  Connections {
+    target: ToplevelManager.toplevels
+    ignoreUnknownSignals: true
+    function onValuesChanged() { if (root.holding) Qt.callLater(root.checkConditions) }
+  }
+
   // ----------------------------------------------------------- the conditions
 
   // Deadlines ride the one-second clock rather than the condition poll, so a
@@ -406,6 +458,17 @@ Item {
   }
 
   function checkConditions() {
+    // App conditions are answered here and now, from the toplevel list.
+    var appResults = ({})
+    var sawApp = false
+    for (var i = 0; i < sessions.length; i++) {
+      var session = sessions[i]
+      if (session.kind !== "app") continue
+      sawApp = true
+      appResults[session.id] = root.appIsOpen(session.app)
+    }
+    if (sawApp) applyResults(appResults)
+
     var pending = SessionModel.watched(sessions)
     if (pending.length === 0) return
     if (evaluator.running) return
@@ -424,6 +487,8 @@ Item {
     for (var i = 0; i < next.length; i++) {
       var session = next[i]
       if (!SessionModel.isWatched(session)) continue
+      // A pass that answered for some sessions says nothing about the others.
+      if (results[session.id] === undefined) continue
       if (results[session.id] === true) {
         session.lastTrueAt = now
         continue
@@ -520,6 +585,8 @@ Item {
       graceSeconds: root.graceSeconds,
       defaultMinutes: root.defaultMinutes,
       defaultScope: root.defaultScope,
+      quickMinutes: root.quickMinutes,
+      quickHours: root.quickHours,
       sessions: SessionModel.publicSessions(root.sessions, now)
     })
   }
@@ -552,6 +619,11 @@ Item {
 
     function list(): string {
       return JSON.stringify(SessionModel.publicSessions(root.sessions, Date.now()))
+    }
+
+    // The open windows, for a picker that offers what is actually running.
+    function apps(): string {
+      return JSON.stringify(root.openApps())
     }
 
     // The standing screensaver switch, separate from any session: "off", "on",

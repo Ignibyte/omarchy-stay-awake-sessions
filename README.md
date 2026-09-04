@@ -10,8 +10,9 @@ container, a login session. When the reason is over, the hold is over.
 
 ```bash
 stay-awake for 90m                       # until half past
-stay-awake until 17:00                   # until a wall-clock time
+stay-awake until 5pm                     # until a time of day
 stay-awake while -- cargo test           # exactly as long as the command runs
+stay-awake while-app mpv                 # while an app has a window open
 stay-awake while-process ffmpeg          # while a process is alive
 stay-awake while-command 'who | grep -q pts'   # while any condition holds
 ```
@@ -62,7 +63,7 @@ present on a stock Omarchy box. The CLI wrapper also uses `jq`.
 
 | | |
 |---|---|
-| Left click | Open the panel: what is held, and buttons to start or end a hold |
+| Left click | Open the panel: what is held, the quick holds, a box to type a duration or a time, and a picker of open apps |
 | Right click | Hold for the default duration, or release everything |
 | Middle click | Release everything |
 
@@ -77,11 +78,23 @@ Every hold is a **session**: a label, a condition, and what it blocks.
 | Condition | What ends it |
 |---|---|
 | `for <duration>` | The clock. `90m`, `2h`, `1h30m`, `45s`, or a bare number as minutes |
-| `until <HH:MM>` | A wall-clock time, today or tomorrow, whichever is next |
+| `until <time>` | A time of day — `17:00`, `5pm`, `5:30pm` — today or tomorrow, whichever is next |
 | `while -- <command>` | The command exiting. No polling: the hold is tied to the child process |
+| `while-app <name>` | The app's last window closing |
 | `while-process <pattern>` | No process matches the pattern any more (`pgrep -f`) |
 | `while-command <shell>` | The command stops exiting 0 |
 | `on` | Nothing. It holds until you end it |
+
+`while-app` is the one Amphetamine users will look for. It matches the app id
+or the window title, case-insensitively, and reads the compositor's own list of
+open windows rather than guessing from process names — so it ends when the last
+window closes, not when some background helper exits. `stay-awake apps` prints
+what is open right now, and the panel offers the same list as a picker.
+
+```bash
+stay-awake apps
+stay-awake while-app mpv --scope screen --label "Watching something"
+```
 
 Conditions are re-checked every few seconds, and a condition is allowed to read
 false for a grace period before its hold ends — long enough that the gap between
@@ -137,7 +150,9 @@ Set these on the widget in Setup > Plugins, or on its entry in
 
 | Key | Default | What it does |
 |---|---|---|
-| `defaultMinutes` | `60` | The one-click hold's length |
+| `defaultMinutes` | `60` | The right-click hold's length |
+| `quickMinutes` | `5, 15, 30` | The minute buttons in the panel, up to six |
+| `quickHours` | `1, 2, 4` | The hour buttons in the panel, up to six |
 | `defaultScope` | `idle` | What a hold blocks when `--scope` is not given |
 | `pollSeconds` | `5` | How often a process or command condition is re-checked |
 | `graceSeconds` | `15` | How long a condition may read false before its hold ends |
@@ -170,6 +185,9 @@ omarchy-shell stayawake status
 omarchy-shell stayawake list
 omarchy-shell stayawake hold 'for=90m label="Render" scope=all'
 omarchy-shell stayawake hold '{"while-process":"ffmpeg","label":"Encoding"}'
+omarchy-shell stayawake hold 'while-app=mpv'
+omarchy-shell stayawake apps
+omarchy-shell stayawake screensaver off
 omarchy-shell stayawake end 3
 omarchy-shell stayawake endAll
 omarchy-shell stayawake toggle

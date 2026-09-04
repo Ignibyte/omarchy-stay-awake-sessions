@@ -18,6 +18,9 @@ Commands:
   while -- <command...>       Run the command with a hold, release when it exits
   while-process <pattern>     Hold while a process matching the pattern runs
   while-command <shell>       Hold while the shell command keeps exiting 0
+  while-app <name>            Hold while an app has a window open. <name> matches
+                              the app id or the window title, case-insensitively
+  apps                        The apps with a window open right now
   end <id>                    End one hold
   screensaver off|on|toggle   The screensaver switch, on its own. Off stops the
                               screensaver and leaves the lock firing on time
@@ -38,6 +41,7 @@ Examples:
   stay-awake while-process cargo --scope all
   stay-awake while-command 'who | grep -q pts' --label "Someone is logged in"
   stay-awake while-process mpv --scope screen --label "Watching something"
+  stay-awake while-app mpv --scope screen
   stay-awake screensaver off
 USAGE
 }
@@ -114,6 +118,13 @@ case "$command_name" in
   while-process)
     [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'while-process' needs a pattern" >&2; exit 1; }
     ipc hold "$(spec while-process "${args[0]}")"
+    ;;
+  while-app)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'while-app' needs an app name; try: stay-awake apps" >&2; exit 1; }
+    ipc hold "$(spec while-app "${args[0]}")"
+    ;;
+  apps)
+    ipc apps | jq -r '.[] | "  \(.appId)\t\(.title)"' | column -t -s $'\t' 2>/dev/null || ipc apps | jq -r '.[].appId'
     ;;
   while-command)
     [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'while-command' needs a shell command" >&2; exit 1; }
