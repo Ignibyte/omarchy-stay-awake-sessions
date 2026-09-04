@@ -144,6 +144,10 @@ Item {
     var idle = root.idleService
     if (!idle) return
 
+    // Settle a leftover hold first, so the flag this reads as the user's own
+    // setting is not one a dead shell left switched on.
+    if (root.pendingRecovery) tryRecover()
+
     if (root.wantIdleHold && !root.holdingIdle) {
       root.userStayAwake = idle.stayAwake === true
       root.holdingIdle = true
@@ -209,10 +213,14 @@ Item {
     stateWriter.running = true
   }
 
-  // Recovery is deliberately one-directional: it only ever puts the flag back
-  // the way it was, and only when the shell that took it is gone. A live shell
-  // pid means this is an ordinary plugin reload, where Component.onDestruction
-  // has already released the hold.
+  // Recovery only ever releases, never re-enables. After a crash there is no
+  // way to tell a flag the user set by hand from one our own dead hold left
+  // behind — and acting on the breadcrumb's recorded prior value poisons the
+  // chain, because the next hold then records the leak as the user's setting.
+  // A machine that never sleeps is the worse of the two mistakes.
+  //
+  // A live shell pid means this is an ordinary plugin reload, where
+  // Component.onDestruction has already released the hold.
   function tryRecover() {
     if (!root.pendingRecovery || !root.idleService) return
 
@@ -220,10 +228,11 @@ Item {
     root.pendingRecovery = null
     if (saved.holding !== true) return
     if (Number(saved.shellPid) === Quickshell.processId) return
+    if (root.holdingIdle) return
 
     root.log("releasing an idle hold left behind by a shell that is gone")
     root.applyingIdleHold = true
-    root.idleService.setIdleEnabled(!saved.restoreTo)
+    root.idleService.setIdleEnabled(true)
     root.applyingIdleHold = false
     root.persistHold(false)
   }

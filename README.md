@@ -112,7 +112,9 @@ If the shell dies while a hold is live, the flag would outlive the process that
 took it, leaving a machine that never sleeps and nothing on screen to say why.
 The plugin leaves a breadcrumb at
 `~/.local/state/omarchy/stay-awake-sessions/hold` and releases any hold it finds
-there whose shell is gone.
+there whose shell is gone. Recovery only ever releases: after a crash there is
+no way to tell a flag you set by hand from one a dead hold left switched on, and
+of the two possible mistakes, a machine that never sleeps is the worse one.
 
 ## From the command line without the wrapper
 
