@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Evaluates every watched stay-awake condition in one pass and prints
+#
+#   <id>\t<0|1>
+#
+# for each. The table arrives base64-encoded on argv on purpose: a pattern
+# passed in the clear would sit in this script's own command line, and a
+# `pgrep -f` for it would then match the very process doing the matching.
+
+set -uo pipefail
+
+encoded="${1:-}"
+[[ -n $encoded ]] || exit 0
+
+table=$(printf '%s' "$encoded" | base64 -d 2>/dev/null) || exit 0
+
+self=$$
+parent=${PPID:-0}
+
+while IFS=$'\t' read -r id kind payload; do
+  [[ -n ${id:-} ]] || continue
+  live=0
+
+  case "${kind:-}" in
+    process)
+      # Belt and braces on top of the base64: drop this script and the shell
+      # that spawned it from the match, so a broad pattern cannot hold itself
+      # awake forever.
+      if pgrep -f -- "$payload" 2>/dev/null | grep -qvx -e "$self" -e "$parent"; then
+        live=1
+      fi
+      ;;
+    command)
+      if bash -c "$payload" >/dev/null 2>&1; then
+        live=1
+      fi
+      ;;
+  esac
+
+  printf '%s\t%s\n' "$id" "$live"
+done <<<"$table"

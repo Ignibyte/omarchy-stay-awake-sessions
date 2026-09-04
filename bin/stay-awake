@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Command-line front end for the Stay Awake Sessions shell plugin.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: stay-awake [command] [options]
+
+Commands:
+  status                      What is holding the machine awake (default)
+  list                        The held sessions as JSON
+  on                          Hold until you stop it
+  off                         End every hold
+  toggle                      Hold for the default duration, or end every hold
+  for <duration>              Hold for 90m, 2h, 1h30m, 45s
+  until <HH:MM>               Hold until a wall-clock time
+  while -- <command...>       Run the command with a hold, release when it exits
+  while-process <pattern>     Hold while a process matching the pattern runs
+  while-command <shell>       Hold while the shell command keeps exiting 0
+  end <id>                    End one hold
+
+Options:
+  --label <text>              What to call this hold in the bar
+  --scope idle|sleep|all      Block the lock, suspend, or both (default: idle)
+  --grace <seconds>           How long a condition may read false before ending
+
+Examples:
+  stay-awake for 90m --label "Render"
+  stay-awake until 17:00
+  stay-awake while -- cargo test --workspace
+  stay-awake while-process cargo --scope all
+  stay-awake while-command 'who | grep -q pts' --label "Someone is logged in"
+USAGE
+}
+
+ipc() {
+  omarchy-shell stayawake "$@"
+}
+
+label=""
+scope=""
+grace=""
+args=()
+
+while (($# > 0)); do
+  case "$1" in
+    --label) label="${2:-}"; shift 2 ;;
+    --scope) scope="${2:-}"; shift 2 ;;
+    --grace) grace="${2:-}"; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    --) shift; args+=("$@"); break ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+# The spec is JSON so a label or a shell condition can hold spaces, quotes and
+# anything else without a quoting dance through the IPC layer.
+spec() {
+  local key="$1" value="$2"
+  jq -nc --arg k "$key" --arg v "$value" --arg l "$label" --arg s "$scope" --arg g "$grace" '
+    { ($k): $v }
+    + (if $l == "" then {} else { label: $l } end)
+    + (if $s == "" then {} else { scope: $s } end)
+    + (if $g == "" then {} else { grace: $g } end)
+  '
+}
+
+command_name="${args[0]:-status}"
+(("${#args[@]}" > 0)) && args=("${args[@]:1}")
+
+case "$command_name" in
+  status)
+    ipc status | jq -r '
+      if .holding | not then "Nothing is holding this machine awake."
+      else
+        "Holding: \(.count) session\(if .count == 1 then "" else "s" end)"
+        + (if .blocksIdle then " · lock" else "" end)
+        + (if .blocksSleep then " · suspend" else "" end),
+        (.sessions[] | "  [\(.id)] \(.label) — \(if .remainingMs >= 0 then "\((.remainingMs / 60000) | floor)m left" else .describes end)")
+      end'
+    ;;
+  list) ipc list | jq . ;;
+  on) ipc hold "$(spec label "${label:-Until you stop it}")" ;;
+  off) ipc endAll ;;
+  toggle) ipc toggle ;;
+  for)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'for' needs a duration, such as 90m" >&2; exit 1; }
+    ipc hold "$(spec for "${args[0]}")"
+    ;;
+  until)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'until' needs a time, such as 17:00" >&2; exit 1; }
+    ipc hold "$(spec until "${args[0]}")"
+    ;;
+  while-process)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'while-process' needs a pattern" >&2; exit 1; }
+    ipc hold "$(spec while-process "${args[0]}")"
+    ;;
+  while-command)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'while-command' needs a shell command" >&2; exit 1; }
+    ipc hold "$(spec while-command "${args[0]}")"
+    ;;
+  while)
+    (("${#args[@]}" > 0)) || { echo "stay-awake: 'while' needs a command, after --" >&2; exit 1; }
+    # No polling and no guessing: the hold lives exactly as long as the child,
+    # and the trap releases it however the child ends.
+    id=$(ipc hold "$(spec label "${label:-${args[0]}}")")
+    [[ $id == error:* ]] && { echo "stay-awake: $id" >&2; exit 1; }
+    trap 'omarchy-shell -q stayawake end "$id"' EXIT INT TERM
+    "${args[@]}"
+    ;;
+  end)
+    [[ -n ${args[0]:-} ]] || { echo "stay-awake: 'end' needs a session id" >&2; exit 1; }
+    ipc end "${args[0]}"
+    ;;
+  -h | --help | help) usage ;;
+  *) echo "stay-awake: unknown command '$command_name'" >&2; usage >&2; exit 1 ;;
+esac

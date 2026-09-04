@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "id": "ignibyte.stay-awake-sessions",
+  "name": "Stay Awake Sessions",
+  "version": "0.1.0",
+  "author": "Ignibyte",
+  "description": "Hold the machine awake for a reason that ends by itself: a deadline, a running process, or any condition you can write as a command.",
+  "homepage": "https://github.com/Ignibyte/omarchy-stay-awake-sessions",
+  "license": "MIT",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Stay Awake",
+    "description": "What is holding the machine awake, and how long is left",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "defaultMinutes": 60,
+      "defaultScope": "idle",
+      "pollSeconds": 5,
+      "graceSeconds": 15,
+      "notify": true,
+      "showWhenIdle": true
+    },
+    "schema": [
+      {
+        "key": "defaultMinutes",
+        "type": "integer",
+        "label": "Quick hold (minutes)",
+        "min": 1,
+        "max": 1440,
+        "step": 5,
+        "defaultValue": 60,
+        "description": "How long the one-click hold lasts."
+      },
+      {
+        "key": "defaultScope",
+        "type": "enum",
+        "label": "What a hold blocks",
+        "options": ["idle", "sleep", "all"],
+        "defaultValue": "idle",
+        "description": "idle: screensaver and lock. sleep: suspend. all: both."
+      },
+      {
+        "key": "pollSeconds",
+        "type": "integer",
+        "label": "Condition check interval (seconds)",
+        "min": 1,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often a process or command condition is re-checked."
+      },
+      {
+        "key": "graceSeconds",
+        "type": "integer",
+        "label": "Grace period (seconds)",
+        "min": 0,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 15,
+        "description": "How long a condition may read false before its hold ends. Covers the gap between two builds."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify when a hold ends",
+        "defaultValue": true
+      },
+      {
+        "key": "showWhenIdle",
+        "type": "boolean",
+        "label": "Keep the icon in the bar when nothing holds",
+        "defaultValue": true
+      }
+    ]
+  }
+}
