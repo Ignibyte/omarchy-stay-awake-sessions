@@ -74,7 +74,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.opened
-    contentWidth: Style.space(320)
+    contentWidth: Style.space(360)
     contentHeight: popup.fittedContentHeight(content.implicitHeight)
 
     Column {
@@ -99,21 +99,25 @@ BarWidget {
         font.pixelSize: Style.font.bodySmall
       }
 
+      // Title, time and the end button share a row; what is holding the
+      // session gets the whole width underneath, because it is the part that
+      // is long and the part worth reading.
       Repeater {
         model: root.rows
 
-        Row {
+        Column {
           required property var modelData
 
           width: content.width
-          spacing: Style.spacing.md
+          spacing: Style.spacing.xxs
 
-          Column {
-            width: content.width - remaining.width - endButton.width - Style.spacing.md * 2
-            spacing: Style.spacing.xxs
+          Row {
+            width: content.width
+            spacing: Style.spacing.md
 
             Text {
-              width: parent.width
+              width: parent.width - remaining.width - endButton.width - Style.spacing.md * 2
+              anchors.verticalCenter: parent.verticalCenter
               elide: Text.ElideRight
               textFormat: Text.PlainText
               text: modelData.label
@@ -123,35 +127,37 @@ BarWidget {
             }
 
             Text {
-              width: parent.width
-              elide: Text.ElideRight
+              id: remaining
+              anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: modelData.describes + " · blocks " + modelData.holds
-              color: Qt.darker(Color.popups.text, 1.4)
+              text: modelData.remainingMs >= 0
+                ? SessionModel.formatRemaining(modelData.remainingMs)
+                : SessionModel.formatElapsed(modelData.heldForMs)
+              color: Color.popups.text
               font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.body
+            }
+
+            Button {
+              id: endButton
+              anchors.verticalCenter: parent.verticalCenter
+              text: "✕"
+              tooltipText: "End this hold"
+              fontSize: Style.font.caption
+              onClicked: if (root.service) root.service.endOne(modelData.id, "ended from the bar")
             }
           }
 
+          // Wrapped, not elided: a condition can be a whole shell command, and
+          // the point of the line is to say exactly what is holding the machine.
           Text {
-            id: remaining
-            anchors.verticalCenter: parent.verticalCenter
+            width: content.width
+            wrapMode: Text.WordWrap
             textFormat: Text.PlainText
-            text: modelData.remainingMs >= 0
-              ? SessionModel.formatRemaining(modelData.remainingMs)
-              : SessionModel.formatElapsed(modelData.heldForMs)
-            color: Color.popups.text
+            text: modelData.describes + " · blocks " + modelData.holds
+            color: Qt.darker(Color.popups.text, 1.4)
             font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Button {
-            id: endButton
-            anchors.verticalCenter: parent.verticalCenter
-            text: "✕"
-            tooltipText: "End this hold"
-            fontSize: Style.font.caption
-            onClicked: if (root.service) root.service.endOne(modelData.id, "ended from the bar")
+            font.pixelSize: Style.font.caption
           }
         }
       }
