@@ -324,7 +324,7 @@ BarWidget {
           tooltipText: "Hold until you stop it"
           bordered: true
           fontSize: Style.font.caption
-          onClicked: root.hold("label=Until you stop it")
+          onClicked: root.hold('label="Until you stop it"')
         }
       }
 
@@ -350,8 +350,8 @@ BarWidget {
               ? modelData.appId : modelData.appId + " — " + modelData.title
             bordered: true
             fontSize: Style.font.caption
-            onClicked: root.hold("while-app=" + modelData.appId
-              + ' label="' + SessionModel.shortAppLabel(modelData.appId) + '"')
+            onClicked: root.hold('while-app="' + modelData.appId
+              + '" label="' + SessionModel.shortAppLabel(modelData.appId) + '"')
           }
         }
       }

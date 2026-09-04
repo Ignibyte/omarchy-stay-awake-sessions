@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ignibyte.stay-awake-sessions",
   "name": "Stay Awake Sessions",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "Ignibyte",
   "description": "Hold the machine awake for a reason that ends by itself: a deadline, a running process, or any condition you can write as a command.",
   "homepage": "https://github.com/Ignibyte/omarchy-stay-awake-sessions",
