@@ -3,7 +3,10 @@
 // Pure session logic, kept out of Service.qml so it can be reasoned about (and
 // exercised) without a running shell. Nothing here touches Qt or the shell.
 
-var LEVERS = { idle: ["idle", "all"], sleep: ["sleep", "all"] }
+// `screen` is deliberately absent from `all`: `idle` already stops the
+// screensaver by holding the Stay Awake flag, so folding it in would raise the
+// screensaver timeout in shell.json for no gain.
+var LEVERS = { idle: ["idle", "all"], sleep: ["sleep", "all"], screen: ["screen"] }
 var KINDS = ["timed", "process", "command", "manual"]
 
 function clampInt(value, min, max, fallback) {
@@ -72,14 +75,36 @@ function formatElapsed(ms) {
 
 function normalizeScope(value, fallback) {
   var s = String(value || "").trim().toLowerCase()
-  if (s === "idle" || s === "sleep" || s === "all") return s
+  if (s === "idle" || s === "sleep" || s === "all" || s === "screen") return s
   return fallback || "idle"
 }
 
 function scopeLabel(scope) {
   if (scope === "sleep") return "suspend"
   if (scope === "all") return "lock and suspend"
+  if (scope === "screen") return "the screensaver"
   return "lock"
+}
+
+// The screensaver is suppressed by pushing idle.screensaver past idle.lock, so
+// the sentinel has to clear the lock as well as any plausible user value.
+function screensaverSentinel(lockSeconds) {
+  var lock = Number(lockSeconds)
+  if (!isFinite(lock) || lock < 0) lock = 0
+  return Math.max(86400, Math.round(lock) + 3600)
+}
+
+var SCREENSAVER_SENTINEL_FLOOR = 86400
+var SCREENSAVER_DEFAULT = 150
+
+// Never take our own sentinel for the user's setting: doing so would record the
+// suppression as the value to restore, and each restart would bake it in deeper.
+function realScreensaverSeconds(current, remembered) {
+  var value = Number(current)
+  if (isFinite(value) && value > 0 && value < SCREENSAVER_SENTINEL_FLOOR) return Math.round(value)
+  var fallback = Number(remembered)
+  if (isFinite(fallback) && fallback > 0 && fallback < SCREENSAVER_SENTINEL_FLOOR) return Math.round(fallback)
+  return SCREENSAVER_DEFAULT
 }
 
 // A spec is either JSON or a run of key=value pairs, so the same entry point

@@ -100,13 +100,35 @@ stay-awake while --scope all -- ./bin/gate.sh --full-regression
 
 | Scope | Effect |
 |---|---|
-| `idle` (default) | The screensaver and the lock screen, through Omarchy's own Stay Awake flag |
+| `screen` | The screensaver only. The screen still locks on time |
+| `idle` (default) | The screensaver and the lock, through Omarchy's own Stay Awake flag |
 | `sleep` | Suspend and hibernate, through a logind `idle:sleep` inhibitor |
-| `all` | Both |
+| `all` | `idle` and `sleep` together |
 
-Omarchy's idle service exposes one flag covering the screensaver and the lock
-together, so this plugin cannot hold one without the other. It does not pretend
-otherwise.
+`screen` is the one for watching something. Omarchy's Stay Awake flag stops the
+screensaver and the lock together, but their timeouts are two separate numbers
+in `shell.json`, so pushing `idle.screensaver` past `idle.lock` stops the
+screensaver on its own and leaves the lock firing on schedule:
+
+```bash
+stay-awake while-process mpv --scope screen --label "Watching something"
+```
+
+## The screensaver switch
+
+Some people just never want the screensaver. That is a preference, not a hold,
+so it gets its own switch — in the panel, and on the command line:
+
+```bash
+stay-awake screensaver off       # the screen still locks on its usual timer
+stay-awake screensaver on
+stay-awake screensaver toggle
+```
+
+The switch persists across restarts, because it edits `idle.screensaver` in
+your `shell.json` and puts your own value back when you turn it on again. Your
+original timeout is remembered, and the plugin will never mistake its own
+suppression for your setting.
 
 ## Options
 

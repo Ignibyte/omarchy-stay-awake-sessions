@@ -19,10 +19,16 @@ Commands:
   while-process <pattern>     Hold while a process matching the pattern runs
   while-command <shell>       Hold while the shell command keeps exiting 0
   end <id>                    End one hold
+  screensaver off|on|toggle   The screensaver switch, on its own. Off stops the
+                              screensaver and leaves the lock firing on time
 
 Options:
   --label <text>              What to call this hold in the bar
-  --scope idle|sleep|all      Block the lock, suspend, or both (default: idle)
+  --scope screen|idle|sleep|all
+                              screen: the screensaver only, the lock still fires
+                              idle:   the screensaver and the lock (default)
+                              sleep:  suspend
+                              all:    idle and sleep
   --grace <seconds>           How long a condition may read false before ending
 
 Examples:
@@ -31,6 +37,8 @@ Examples:
   stay-awake while -- cargo test --workspace
   stay-awake while-process cargo --scope all
   stay-awake while-command 'who | grep -q pts' --label "Someone is logged in"
+  stay-awake while-process mpv --scope screen --label "Watching something"
+  stay-awake screensaver off
 USAGE
 }
 
@@ -70,11 +78,22 @@ command_name="${args[0]:-status}"
 (("${#args[@]}" > 0)) && args=("${args[@]:1}")
 
 case "$command_name" in
+  screensaver)
+    ipc screensaver "${args[0]:-status}" | while read -r state; do
+      if [[ ${args[0]:-status} == status ]]; then
+        echo "Screensaver switch: $state"
+      else
+        echo "Screensaver $state"
+      fi
+    done
+    ;;
   status)
     ipc status | jq -r '
+      (if .screensaverSwitch == "off" then "Screensaver switch: off (the screen still locks at \(.lockSeconds / 60 | floor)m)" else empty end),
       if .holding | not then "Nothing is holding this machine awake."
       else
         "Holding: \(.count) session\(if .count == 1 then "" else "s" end)"
+        + (if .screensaverOff and (.blocksIdle | not) then " · screensaver" else "" end)
         + (if .blocksIdle then " · lock" else "" end)
         + (if .blocksSleep then " · suspend" else "" end),
         (.sessions[] | "  [\(.id)] \(.label) — \(if .remainingMs >= 0 then "\((.remainingMs / 60000) | floor)m left" else .describes end)")

@@ -37,6 +37,12 @@ Item {
   readonly property int graceSeconds: SessionModel.clampInt(config.graceSeconds, 0, 600, 15)
   readonly property bool notifyOnEnd: config.notify !== false
 
+  readonly property var idleConfig: shell && shell.shellConfig && shell.shellConfig.idle
+    ? shell.shellConfig.idle : ({})
+  readonly property int lockSeconds: SessionModel.clampInt(idleConfig.lock, 1, 86400, 300)
+  readonly property int configuredScreensaverSeconds: SessionModel.clampInt(idleConfig.screensaver, 1, 604800, 150)
+  readonly property int screensaverSentinel: SessionModel.screensaverSentinel(lockSeconds)
+
   property var sessions: []
   property int nextSessionId: 1
   property double nowMs: Date.now()
@@ -44,9 +50,19 @@ Item {
   readonly property bool holding: sessions.length > 0
   readonly property bool wantIdleHold: SessionModel.anyHolds(sessions, "idle")
   readonly property bool wantSleepHold: SessionModel.anyHolds(sessions, "sleep")
+  readonly property bool wantScreensaverOff: standingScreensaverOff || SessionModel.anyHolds(sessions, "screen")
 
   property bool holdingIdle: false
   property bool userStayAwake: false
+
+  // The screensaver lever. Omarchy's Stay Awake flag stops the screensaver and
+  // the lock together, but the two timeouts are separate numbers in shell.json:
+  // pushing idle.screensaver past idle.lock stops the screensaver on its own and
+  // leaves the lock firing. `standingScreensaverOff` is the preference switch;
+  // a session with `scope: screen` holds the same lever for its own lifetime.
+  property bool standingScreensaverOff: false
+  property bool suppressingScreensaver: false
+  property int savedScreensaverSeconds: 0
   // Set around our own writes to the idle flag so the change we just made is
   // not read back as the user overriding us.
   property bool applyingIdleHold: false
@@ -59,6 +75,8 @@ Item {
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/stay-awake-sessions"
   readonly property string statePath: stateDir + "/hold"
   property var pendingRecovery: null
+  property string pendingStatePayload: ""
+  property bool hasPendingStatePayload: false
 
 
   // ------------------------------------------------------------- sessions
@@ -139,6 +157,7 @@ Item {
 
   onWantIdleHoldChanged: syncIdleHold()
   onWantSleepHoldChanged: syncSleepHold()
+  onWantScreensaverOffChanged: syncScreensaverHold()
 
   function syncIdleHold() {
     var idle = root.idleService
@@ -154,14 +173,52 @@ Item {
       root.applyingIdleHold = true
       idle.setIdleEnabled(false)
       root.applyingIdleHold = false
-      root.persistHold(true)
+      root.persistState()
     } else if (!root.wantIdleHold && root.holdingIdle) {
       root.holdingIdle = false
       root.applyingIdleHold = true
       idle.setIdleEnabled(!root.userStayAwake)
       root.applyingIdleHold = false
-      root.persistHold(false)
+      root.persistState()
     }
+  }
+
+  // Written through the shell's own mutator so the edit lands on the config the
+  // shell currently holds, rather than racing whatever else is writing the file.
+  function writeScreensaverSeconds(value) {
+    if (!shell || typeof shell.mutateShellConfig !== "function") return false
+    shell.mutateShellConfig(function(copy) {
+      if (!copy.idle || typeof copy.idle !== "object") copy.idle = {}
+      copy.idle.screensaver = value
+    })
+    return true
+  }
+
+  function syncScreensaverHold() {
+    if (!shell || typeof shell.mutateShellConfig !== "function") return
+
+    if (root.wantScreensaverOff && !root.suppressingScreensaver) {
+      root.savedScreensaverSeconds = SessionModel.realScreensaverSeconds(
+        root.configuredScreensaverSeconds, root.savedScreensaverSeconds)
+      root.suppressingScreensaver = true
+      root.writeScreensaverSeconds(root.screensaverSentinel)
+      root.log("screensaver off (was " + root.savedScreensaverSeconds + "s)")
+      root.persistState()
+    } else if (!root.wantScreensaverOff && root.suppressingScreensaver) {
+      var restored = SessionModel.realScreensaverSeconds(0, root.savedScreensaverSeconds)
+      root.suppressingScreensaver = false
+      root.writeScreensaverSeconds(restored)
+      root.log("screensaver back on at " + restored + "s")
+      root.persistState()
+    }
+  }
+
+  function setScreensaverOff(off) {
+    root.standingScreensaverOff = !!off
+    // A standing switch outlives the shell, so record which kind of suppression
+    // this is even when a session already had the lever held.
+    root.persistState()
+    return root.standingScreensaverOff ? "off" : "on"
   }
 
   function syncSleepHold() {
@@ -197,14 +254,34 @@ Item {
     }
   }
 
-  // `held` rather than `holding`: a parameter that shadows a property of the
-  // same name on this object is a trap QML will not warn about.
-  function persistHold(held) {
+  // No parameters on purpose: a parameter that shadows a property of the same
+  // name on this object silently resolves to the property, and QML gives no
+  // warning. Reading the state straight off `root` cannot go wrong that way.
+  function persistState() {
     var payload = JSON.stringify({
-      holding: !!held,
+      holding: !!root.holdingIdle,
       restoreTo: !!root.userStayAwake,
-      shellPid: Quickshell.processId
+      shellPid: Quickshell.processId,
+      screensaver: {
+        suppressed: !!root.suppressingScreensaver,
+        mode: root.standingScreensaverOff ? "standing" : "session",
+        original: root.savedScreensaverSeconds
+      }
     })
+    // Setting `running` on a Process that is already running does nothing, and
+    // the replaced command is simply lost — so two state changes in quick
+    // succession would leave the breadcrumb holding whichever one happened to
+    // win, which is how a session-scoped suppression came back as a standing
+    // one. Queue instead, and let the last write stand.
+    if (stateWriter.running) {
+      root.pendingStatePayload = payload
+      root.hasPendingStatePayload = true
+      return
+    }
+    root.writeState(payload)
+  }
+
+  function writeState(payload) {
     // argv rather than an interpolated command line: the payload never has to
     // survive a round of shell quoting, and the directory is made on the way.
     stateWriter.command = ["bash", "-c",
@@ -226,15 +303,47 @@ Item {
 
     var saved = root.pendingRecovery
     root.pendingRecovery = null
+    var deadShell = Number(saved.shellPid) !== Quickshell.processId
+
+    recoverScreensaver(saved.screensaver)
+
     if (saved.holding !== true) return
-    if (Number(saved.shellPid) === Quickshell.processId) return
+    if (!deadShell) return
     if (root.holdingIdle) return
 
     root.log("releasing an idle hold left behind by a shell that is gone")
     root.applyingIdleHold = true
     root.idleService.setIdleEnabled(true)
     root.applyingIdleHold = false
-    root.persistHold(false)
+    root.persistState()
+  }
+
+  // The screensaver splits from the idle flag here. A standing switch is a
+  // preference and is meant to outlive the shell, so it is adopted rather than
+  // undone — the plugin picks the lever back up and keeps owning it. A
+  // session-scoped suppression had a lifetime that died with the shell, so its
+  // timeout goes back, or the user's screensaver stays silently dead in
+  // shell.json with nothing left to explain it.
+  function recoverScreensaver(saver) {
+    if (!saver || saver.suppressed !== true) return
+    var original = SessionModel.realScreensaverSeconds(0, saver.original)
+
+    if (String(saver.mode) === "standing") {
+      root.savedScreensaverSeconds = original
+      root.suppressingScreensaver = true
+      root.standingScreensaverOff = true
+      return
+    }
+
+    // Session-scoped, and this instance has no sessions: whether the shell died
+    // or the plugin merely reloaded, whatever justified the suppression is gone.
+    // Writing the original back is idempotent, so doing it in both cases costs
+    // nothing and closes the reload leak.
+    root.log("restoring the screensaver timeout left raised with no session behind it")
+    root.savedScreensaverSeconds = original
+    root.suppressingScreensaver = false
+    root.writeScreensaverSeconds(original)
+    root.persistState()
   }
 
   Process {
@@ -243,7 +352,14 @@ Item {
       waitForEnd: true
       onStreamFinished: if (String(text || "").trim() !== "") root.log("state write: " + text)
     }
-    onExited: function(exitCode) { if (exitCode !== 0) root.log("state write failed, exit " + exitCode) }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.log("state write failed, exit " + exitCode)
+      if (!root.hasPendingStatePayload) return
+      var payload = root.pendingStatePayload
+      root.hasPendingStatePayload = false
+      root.pendingStatePayload = ""
+      root.writeState(payload)
+    }
   }
 
   FileView {
@@ -389,6 +505,11 @@ Item {
       count: root.sessions.length,
       blocksIdle: root.wantIdleHold,
       blocksSleep: root.wantSleepHold,
+      screensaverOff: root.wantScreensaverOff,
+      screensaverSwitch: root.standingScreensaverOff ? "off" : "on",
+      screensaverSeconds: root.suppressingScreensaver
+        ? root.savedScreensaverSeconds : root.configuredScreensaverSeconds,
+      lockSeconds: root.lockSeconds,
       sleepInhibitorRunning: sleepInhibitor.running,
       idleServiceReachable: !!root.idleService,
       stayAwake: root.idleService ? root.idleService.stayAwake : null,
@@ -432,15 +553,29 @@ Item {
     function list(): string {
       return JSON.stringify(SessionModel.publicSessions(root.sessions, Date.now()))
     }
+
+    // The standing screensaver switch, separate from any session: "off", "on",
+    // "toggle", or anything else to read it back.
+    function screensaver(action: string): string {
+      var wanted = String(action || "").trim().toLowerCase()
+      if (wanted === "off") return root.setScreensaverOff(true)
+      if (wanted === "on") return root.setScreensaverOff(false)
+      if (wanted === "toggle") return root.setScreensaverOff(!root.standingScreensaverOff)
+      return root.standingScreensaverOff ? "off" : "on"
+    }
   }
 
   Component.onDestruction: {
-    // Leaving the flag held after the plugin is disabled would strand the
+    // Leaving a lever held after the plugin is disabled would strand the
     // machine awake with nothing left to release it.
     if (root.holdingIdle && root.idleService) {
       root.applyingIdleHold = true
       root.idleService.setIdleEnabled(!root.userStayAwake)
       root.applyingIdleHold = false
+    }
+    // A standing switch is a preference and stays; a session's suppression goes.
+    if (root.suppressingScreensaver && !root.standingScreensaverOff) {
+      root.writeScreensaverSeconds(SessionModel.realScreensaverSeconds(0, root.savedScreensaverSeconds))
     }
     if (sleepInhibitor.running) sleepInhibitor.running = false
   }

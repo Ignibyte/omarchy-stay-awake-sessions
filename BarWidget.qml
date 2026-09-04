@@ -23,6 +23,7 @@ BarWidget {
   readonly property string countdown: SessionModel.barLabel(heldSessions, nowMs)
   readonly property var rows: SessionModel.publicSessions(heldSessions, nowMs)
   readonly property bool showWhenIdle: setting("showWhenIdle", true) !== false
+  readonly property bool screensaverOff: service ? service.standingScreensaverOff : false
   readonly property int defaultMinutes: service ? service.defaultMinutes : 60
 
   property bool opened: false
@@ -159,6 +160,48 @@ BarWidget {
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
+        }
+      }
+
+      PanelSeparator { }
+
+      // The screensaver switch stands apart from the sessions: it is a
+      // preference that persists, not a hold with an end in sight.
+      Row {
+        width: content.width
+        spacing: Style.spacing.md
+
+        Column {
+          width: content.width - screensaverSwitch.width - Style.spacing.md
+          spacing: Style.spacing.xxs
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "Screensaver"
+            color: Color.popups.text
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.screensaverOff
+              ? "Off. The screen still locks on its usual timer."
+              : "On, after the usual idle time."
+            color: Qt.darker(Color.popups.text, 1.4)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        ToggleSwitch {
+          id: screensaverSwitch
+          anchors.verticalCenter: parent.verticalCenter
+          checked: !root.screensaverOff
+          onToggled: if (root.service) root.service.setScreensaverOff(root.screensaverOff ? false : true)
         }
       }
 
