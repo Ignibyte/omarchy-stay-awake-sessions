@@ -24,8 +24,13 @@ BarWidget {
   readonly property var rows: SessionModel.publicSessions(heldSessions, nowMs)
   readonly property bool showWhenIdle: setting("showWhenIdle", true) !== false
   readonly property bool screensaverOff: service ? service.standingScreensaverOff : false
-  readonly property var quickMinutes: service ? service.quickMinutes : [5, 15, 30]
-  readonly property var quickHours: service ? service.quickHours : [1, 2, 4]
+  readonly property var quickMinutes: service ? service.quickMinutes : [5, 15, 30, 45]
+  readonly property var quickHours: service ? service.quickHours : [1, 2, 4, 8]
+  // Both rows share one column grid: the label column, then as many equal
+  // columns as the longer list needs, so 15m sits above 2h rather than each
+  // button taking its own width.
+  readonly property int quickColumns: Math.max(1, quickMinutes.length, quickHours.length)
+  readonly property int quickLabelWidth: Style.space(52)
 
   // Read when the panel opens rather than bound: a picker only has to be right
   // at the moment it is looked at, and this keeps the widget off the
@@ -230,12 +235,14 @@ BarWidget {
       // Two rows because minutes and hours are two different intentions, and
       // both lists come from settings — everyone's idea of a short hold differs.
       Row {
+        id: minutesRow
         width: content.width
         spacing: Style.spacing.sm
+        readonly property int buttonWidth: Math.floor((width - root.quickLabelWidth - spacing * root.quickColumns) / root.quickColumns)
 
         Text {
           anchors.verticalCenter: parent.verticalCenter
-          width: Style.space(52)
+          width: root.quickLabelWidth
           textFormat: Text.PlainText
           text: "Minutes"
           color: Qt.darker(Color.popups.text, 1.4)
@@ -248,6 +255,7 @@ BarWidget {
 
           Button {
             required property var modelData
+            width: minutesRow.buttonWidth
             text: modelData + "m"
             bordered: true
             fontSize: Style.font.caption
@@ -257,12 +265,14 @@ BarWidget {
       }
 
       Row {
+        id: hoursRow
         width: content.width
         spacing: Style.spacing.sm
+        readonly property int buttonWidth: Math.floor((width - root.quickLabelWidth - spacing * root.quickColumns) / root.quickColumns)
 
         Text {
           anchors.verticalCenter: parent.verticalCenter
-          width: Style.space(52)
+          width: root.quickLabelWidth
           textFormat: Text.PlainText
           text: "Hours"
           color: Qt.darker(Color.popups.text, 1.4)
@@ -275,6 +285,7 @@ BarWidget {
 
           Button {
             required property var modelData
+            width: hoursRow.buttonWidth
             text: modelData + "h"
             bordered: true
             fontSize: Style.font.caption

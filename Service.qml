@@ -38,8 +38,8 @@ Item {
   readonly property int graceSeconds: SessionModel.clampInt(config.graceSeconds, 0, 600, 15)
   readonly property bool notifyOnEnd: config.notify !== false
   readonly property bool notifyOnStart: config.notifyOnStart === true
-  readonly property var quickMinutes: SessionModel.parseNumberList(config.quickMinutes, [5, 15, 30], 1, 1440, 6)
-  readonly property var quickHours: SessionModel.parseNumberList(config.quickHours, [1, 2, 4], 1, 24, 6)
+  readonly property var quickMinutes: SessionModel.parseNumberList(config.quickMinutes, [5, 15, 30, 45], 1, 1440, 6)
+  readonly property var quickHours: SessionModel.parseNumberList(config.quickHours, [1, 2, 4, 8], 1, 24, 6)
 
   readonly property var idleConfig: shell && shell.shellConfig && shell.shellConfig.idle
     ? shell.shellConfig.idle : ({})
@@ -50,6 +50,7 @@ Item {
   property var sessions: []
   property int nextSessionId: 1
   property double nowMs: Date.now()
+  onSessionsChanged: persistState()
 
   readonly property bool holding: sessions.length > 0
   readonly property bool wantIdleHold: SessionModel.anyHolds(sessions, "idle")
@@ -58,6 +59,11 @@ Item {
 
   property bool holdingIdle: false
   property bool userStayAwake: false
+  // When the idle lever was last taken, and whether the one re-assertion the
+  // settle window allows has been spent.
+  property double idleHeldAt: 0
+  property bool reassertedIdle: false
+  readonly property int settleMs: 3000
 
   // The screensaver lever. Omarchy's Stay Awake flag stops the screensaver and
   // the lock together, but the two timeouts are separate numbers in shell.json:
@@ -76,6 +82,8 @@ Item {
   // A crash-recovery breadcrumb. The shell can die (or be restarted) while
   // sessions hold the idle flag, and the flag outlives the process that took
   // it — leaving a machine that never sleeps and no session left to say why.
+  // The same file carries the sessions themselves, so the next shell can pick
+  // the holds back up instead of quietly dropping what the user asked for.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/stay-awake-sessions"
   readonly property string statePath: stateDir + "/hold"
   property var pendingRecovery: null
@@ -168,15 +176,19 @@ Item {
 
   function syncIdleHold() {
     var idle = root.idleService
-    if (!idle) return
+    if (!idle || !root.idleStateReady) return
 
     // Settle a leftover hold first, so the flag this reads as the user's own
-    // setting is not one a dead shell left switched on.
-    if (root.pendingRecovery) tryRecover()
+    // setting is not one a dead shell left switched on. Until recovery has
+    // run, nothing is taken: the sessions that want the lever are either the
+    // ones about to be rebuilt, or new ones that can wait the same beat.
+    if (root.pendingRecovery) { recoveryDelay.restart(); return }
 
     if (root.wantIdleHold && !root.holdingIdle) {
       root.userStayAwake = idle.stayAwake === true
       root.holdingIdle = true
+      root.idleHeldAt = Date.now()
+      root.reassertedIdle = false
       root.applyingIdleHold = true
       idle.setIdleEnabled(false)
       root.applyingIdleHold = false
@@ -248,16 +260,30 @@ Item {
   // Turning the stock Stay Awake indicator off while sessions hold it is a
   // clear instruction: the user wants the machine to sleep again, so the
   // sessions go with it rather than silently switching the flag back on.
+  //
+  // One exception. At startup the idle service reads its own flag file through
+  // a child process and applies whatever it finds when that lands, even over a
+  // hold taken a moment earlier by IPC; the result is a flip to off within a
+  // second of the hold, which is not the user. Inside a short settle window
+  // the hold is taken again, once, and logged. A second flip, or one later
+  // than the window, is the user and is obeyed.
   Connections {
     target: root.idleService
     ignoreUnknownSignals: true
     function onStayAwakeChanged() {
       if (root.applyingIdleHold) return
       if (!root.holdingIdle) return
-      if (root.idleService && root.idleService.stayAwake === false) {
-        root.userStayAwake = false
-        root.endAll("Stay Awake was switched off")
+      if (!root.idleService || root.idleService.stayAwake !== false) return
+      if (!root.reassertedIdle && Date.now() - root.idleHeldAt < root.settleMs) {
+        root.reassertedIdle = true
+        root.log("the idle service loaded its state over a fresh hold; taking the hold again")
+        root.applyingIdleHold = true
+        root.idleService.setIdleEnabled(false)
+        root.applyingIdleHold = false
+        return
       }
+      root.userStayAwake = false
+      root.endAll("Stay Awake was switched off")
     }
   }
 
@@ -269,6 +295,8 @@ Item {
       holding: !!root.holdingIdle,
       restoreTo: !!root.userStayAwake,
       shellPid: Quickshell.processId,
+      savedAt: Date.now(),
+      sessions: SessionModel.persistableSessions(root.sessions),
       screensaver: {
         suppressed: !!root.suppressingScreensaver,
         mode: root.standingScreensaverOff ? "standing" : "session",
@@ -297,32 +325,79 @@ Item {
     stateWriter.running = true
   }
 
-  // Recovery only ever releases, never re-enables. After a crash there is no
-  // way to tell a flag the user set by hand from one our own dead hold left
-  // behind — and acting on the breadcrumb's recorded prior value poisons the
-  // chain, because the next hold then records the leak as the user's setting.
-  // A machine that never sleeps is the worse of the two mistakes.
+  // Recovery of the flag only ever releases, never re-enables. After a crash
+  // there is no way to tell a flag the user set by hand from one our own dead
+  // hold left behind — and acting on the breadcrumb's recorded prior value
+  // poisons the chain, because the next hold then records the leak as the
+  // user's setting. A machine that never sleeps is the worse of the two
+  // mistakes.
+  //
+  // The sessions are another matter: the user asked for them, and a shell
+  // restart is not the user changing their mind. Once the flag is settled they
+  // are rebuilt and take the levers again through the ordinary path, which
+  // records the flag as it stands after the release, so nothing leaks.
   //
   // A live shell pid means this is an ordinary plugin reload, where
   // Component.onDestruction has already released the hold.
+  // The idle service reads its own flag file asynchronously at startup and
+  // applies whatever it finds when the read lands. A hold taken before that
+  // moment is overwritten by it, and the flip then reads as the user switching
+  // Stay Awake off, which ends every session. So nothing here touches the flag
+  // until that service says its state is loaded; a shell without the property
+  // reports undefined, which is not false, and proceeds as before.
+  readonly property bool idleStateReady: !!idleService && idleService.stayAwakeStateLoaded !== false
+
   function tryRecover() {
-    if (!root.pendingRecovery || !root.idleService) return
+    if (!root.pendingRecovery || !root.idleService || !root.idleStateReady) return
 
     var saved = root.pendingRecovery
     root.pendingRecovery = null
+    var now = Date.now()
     var deadShell = Number(saved.shellPid) !== Quickshell.processId
+    var leftHolding = saved.holding === true && deadShell && !root.holdingIdle
 
     recoverScreensaver(saved.screensaver)
 
-    if (saved.holding !== true) return
-    if (!deadShell) return
-    if (root.holdingIdle) return
+    var restored = SessionModel.restoreSessions(saved.sessions, saved.savedAt, now, defaults())
+    var keeping = !restored.stale && restored.sessions.length > 0 && root.sessions.length === 0
+    var wantsIdle = keeping && SessionModel.anyHolds(restored.sessions, "idle")
 
-    root.log("releasing an idle hold left behind by a shell that is gone")
-    root.applyingIdleHold = true
-    root.idleService.setIdleEnabled(true)
-    root.applyingIdleHold = false
-    root.persistState()
+    if (leftHolding && wantsIdle) {
+      // The holds being kept want the flag on, and a dead shell left it on.
+      // Adopt it as this shell's own hold rather than release it and take it
+      // straight back: the idle service persists every change through a file
+      // it also watches, and two writes a millisecond apart make it read its
+      // own file mid-flight and flip the flag under us. The user's setting is
+      // taken as off, exactly what a release would have recorded.
+      root.log("adopting the idle hold left by a shell that is gone, for the holds being kept")
+      root.userStayAwake = false
+      root.holdingIdle = true
+      root.idleHeldAt = now
+      root.reassertedIdle = false
+      root.applyingIdleHold = true
+      root.idleService.setIdleEnabled(false)
+      root.applyingIdleHold = false
+      root.persistState()
+    } else if (leftHolding) {
+      root.log("releasing an idle hold left behind by a shell that is gone")
+      root.applyingIdleHold = true
+      root.idleService.setIdleEnabled(true)
+      root.applyingIdleHold = false
+      root.persistState()
+    }
+
+    if (restored.stale) {
+      root.log("not restoring holds from a breadcrumb older than the restore window")
+      root.persistState()
+      return
+    }
+    if (restored.expired.length > 0) finish(restored.expired, "the time was up while the shell was away")
+    if (!keeping) return
+    if (restored.nextId > root.nextSessionId) root.nextSessionId = restored.nextId
+    root.sessions = restored.sessions
+    root.log("kept " + restored.sessions.length + (restored.sessions.length === 1 ? " hold" : " holds")
+      + " across a shell " + (deadShell ? "restart" : "reload") + ": " + SessionModel.sessionLabels(restored.sessions))
+    Qt.callLater(root.checkConditions)
   }
 
   // The screensaver splits from the idle flag here. A standing switch is a
@@ -373,6 +448,7 @@ Item {
     id: holdState
     path: root.statePath
     atomicWrites: true
+    blockWrites: true
     printErrors: false
     onLoaded: {
       try {
@@ -380,13 +456,34 @@ Item {
       } catch (error) {
         root.pendingRecovery = null
       }
-      root.tryRecover()
+      if (root.pendingRecovery && root.idleStateReady) recoveryDelay.restart()
     }
   }
 
   onIdleServiceChanged: {
-    tryRecover()
-    syncIdleHold()
+    if (!idleStateReady) return
+    if (root.pendingRecovery) recoveryDelay.restart()
+    else syncIdleHold()
+  }
+
+  onIdleStateReadyChanged: {
+    if (!idleStateReady) return
+    if (root.pendingRecovery) recoveryDelay.restart()
+    else syncIdleHold()
+  }
+
+  // `stayAwakeStateLoaded` turns true on the idle service's first apply from
+  // any source, which can be an IPC call that lands before its own file probe
+  // does. The probe follows within a few hundred milliseconds, so recovery
+  // waits a little past that rather than racing it.
+  Timer {
+    id: recoveryDelay
+    interval: 1500
+    repeat: false
+    onTriggered: {
+      root.tryRecover()
+      root.syncIdleHold()
+    }
   }
 
   Process {
@@ -637,7 +734,35 @@ Item {
     }
   }
 
+  // The plugin's entry gone from the config the shell holds means this
+  // destruction is a disable or a remove, not a shell going down. The user
+  // switched the plugin off, so the holds go with it and must not be rebuilt
+  // when it is switched back on. Written through the FileView, synchronously,
+  // because a child process started this late may never get to run.
+  function forgetSessionsIfDisabled() {
+    if (!shell || !shell.shellConfig) return
+    var entry = SessionModel.settingsFor(shell.shellConfig, root.pluginId)
+    var stillEnabled = false
+    for (var key in entry) { stillEnabled = true; break }
+    if (stillEnabled) return
+    if (root.sessions.length === 0) return
+    root.log("plugin disabled with " + root.sessions.length + " held; forgetting them")
+    holdState.setText(JSON.stringify({
+      holding: false,
+      restoreTo: false,
+      shellPid: Quickshell.processId,
+      savedAt: Date.now(),
+      sessions: [],
+      screensaver: {
+        suppressed: !!root.suppressingScreensaver && root.standingScreensaverOff,
+        mode: root.standingScreensaverOff ? "standing" : "session",
+        original: root.savedScreensaverSeconds
+      }
+    }) + "\n")
+  }
+
   Component.onDestruction: {
+    forgetSessionsIfDisabled()
     // Leaving a lever held after the plugin is disabled would strand the
     // machine awake with nothing left to release it.
     if (root.holdingIdle && root.idleService) {

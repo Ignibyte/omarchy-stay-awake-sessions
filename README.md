@@ -57,7 +57,8 @@ takes back out.
 
 Omarchy 4 (Quattro). Beyond what Omarchy already installs, it uses `bash`,
 `pgrep` (procps-ng), `systemd-inhibit` and `notify-send` (libnotify) — all
-present on a stock Omarchy box. The CLI wrapper also uses `jq`.
+present on a stock Omarchy box. The CLI wrapper also uses `jq`. The session
+logic in `SessionModel.js` runs under node: `node test/session-model-test.js`.
 
 ## The bar widget
 
@@ -151,8 +152,8 @@ Set these on the widget in Setup > Plugins, or on its entry in
 | Key | Default | What it does |
 |---|---|---|
 | `defaultMinutes` | `60` | The right-click hold's length |
-| `quickMinutes` | `5, 15, 30` | The minute buttons in the panel, up to six |
-| `quickHours` | `1, 2, 4` | The hour buttons in the panel, up to six |
+| `quickMinutes` | `5, 15, 30, 45` | The minute buttons in the panel, up to six |
+| `quickHours` | `1, 2, 4, 8` | The hour buttons in the panel, up to six |
 | `defaultScope` | `idle` | What a hold blocks when `--scope` is not given |
 | `pollSeconds` | `5` | How often a process or command condition is re-checked |
 | `graceSeconds` | `15` | How long a condition may read false before its hold ends |
@@ -168,11 +169,24 @@ and when the session ends the flag is still on.
 Switching Stay Awake **off** by hand while sessions are running ends them. You
 asked for the machine to sleep; the sessions do not argue.
 
-If the shell dies while a hold is live, the flag would outlive the process that
-took it, leaving a machine that never sleeps and nothing on screen to say why.
-The plugin leaves a breadcrumb at
-`~/.local/state/omarchy/stay-awake-sessions/hold` and releases any hold it finds
-there whose shell is gone. Recovery only ever releases: after a crash there is
+## Surviving a shell restart
+
+Holds outlive the shell. `omarchy-restart-shell`, a plugin reload, a crash, or
+the shell relaunching itself all bring the same sessions back: a timed hold
+keeps its deadline, an app, process or command hold starts its grace period
+again and ends the normal way if the thing it was waiting on is really gone,
+and a hold whose time ran out while the shell was away is reported as ended.
+The breadcrumb at `~/.local/state/omarchy/stay-awake-sessions/hold` carries the
+sessions along with the flag, and a new shell rebuilds them if the breadcrumb is
+less than fifteen minutes old, so a reboot or a plugin switched back on the
+next day starts clean. Disabling the plugin forgets them on the spot.
+
+The flag itself is handled more carefully than the sessions. If the shell dies
+while a hold is live, the Stay Awake flag would outlive the process that took
+it, leaving a machine that never sleeps and nothing on screen to say why. A new
+shell first releases any hold it finds in the breadcrumb whose shell is gone,
+and only then rebuilds the sessions, which take the flag again through the
+ordinary path. Recovery of the flag only ever releases: after a crash there is
 no way to tell a flag you set by hand from one a dead hold left switched on, and
 of the two possible mistakes, a machine that never sleeps is the worse one.
 
@@ -197,8 +211,11 @@ A spec is either `key=value` pairs or JSON. `hold` returns the new session's id.
 
 ## Development
 
-The plugin is a git checkout in `~/.config/omarchy/plugins/`. Saving a file
-reloads the plugin in place; `omarchy-shell shell rescanPlugins` forces it.
+The plugin is a git checkout in `~/.config/omarchy/plugins/`. Saving a file is
+meant to reload the plugin in place, but that reload is known to get stuck;
+`omarchy-restart-shell` is the reliable way to load a change, and since 0.5.0
+the holds come back after it. `node test/session-model-test.js` runs the
+session logic without a shell.
 
 `SessionModel.js` holds every decision about durations, conditions and
 formatting as plain functions, so the logic can be read and exercised without a

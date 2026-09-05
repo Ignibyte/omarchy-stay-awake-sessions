@@ -404,6 +404,76 @@ function settingsFor(shellConfig, pluginId) {
   return {}
 }
 
+// ---- surviving a shell restart
+
+// A breadcrumb older than this is a reboot or a plugin switched back on much
+// later, not a restart, and its holds stay dead.
+var RESTORE_WINDOW_MS = 15 * 60 * 1000
+
+// What the breadcrumb keeps of each session, enough for a new shell to
+// rebuild it: the condition, the deadline and the label, not the runtime.
+function persistableSessions(sessions) {
+  var out = []
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i]
+    out.push({
+      id: s.id, kind: s.kind, label: s.label, scope: s.scope, startedAt: s.startedAt,
+      expiresAt: s.expiresAt, pattern: s.pattern, command: s.command, app: s.app,
+      graceSeconds: s.graceSeconds
+    })
+  }
+  return out
+}
+
+// The sessions a previous shell held, rebuilt. Timed holds keep their
+// deadline, and one that passed while the shell was away comes back under
+// `expired` so it can be reported rather than silently dropped. Conditions
+// start their grace period afresh, so a window or process that is really gone
+// ends the hold the normal way a few seconds later. `stale` means the
+// breadcrumb was too old to trust and nothing was rebuilt.
+function restoreSessions(saved, savedAt, nowMs, defaults) {
+  var out = { sessions: [], expired: [], nextId: 1, stale: false }
+  if (!Array.isArray(saved) || saved.length === 0) return out
+  var age = nowMs - Number(savedAt)
+  if (!(Number(savedAt) > 0) || age < 0 || age > RESTORE_WINDOW_MS) {
+    out.stale = true
+    return out
+  }
+  for (var i = 0; i < saved.length; i++) {
+    var s = saved[i]
+    if (!s || KINDS.indexOf(String(s.kind)) === -1) continue
+    var session = {
+      id: String(s.id || (i + 1)),
+      kind: String(s.kind),
+      label: String(s.label || ""),
+      scope: normalizeScope(s.scope, defaults.scope),
+      startedAt: Number(s.startedAt) > 0 ? Number(s.startedAt) : nowMs,
+      lastTrueAt: nowMs,
+      expiresAt: Number(s.expiresAt) > 0 ? Number(s.expiresAt) : 0,
+      pattern: String(s.pattern || ""),
+      command: String(s.command || ""),
+      app: String(s.app || ""),
+      graceSeconds: clampInt(s.graceSeconds, 0, 600, defaults.graceSeconds)
+    }
+    if (session.kind === "timed" && session.expiresAt <= 0) continue
+    if (session.kind === "app" && session.app === "") continue
+    if (session.kind === "process" && session.pattern === "") continue
+    if (session.kind === "command" && session.command === "") continue
+    if (session.label === "") session.label = session.kind === "manual" ? "Until you stop it" : (session.app || session.pattern || "Condition")
+    var numericId = parseInt(session.id, 10)
+    if (isFinite(numericId) && numericId >= out.nextId) out.nextId = numericId + 1
+    if (session.kind === "timed" && nowMs >= session.expiresAt) out.expired.push(session)
+    else out.sessions.push(session)
+  }
+  return out
+}
+
+function sessionLabels(sessions) {
+  var out = []
+  for (var i = 0; i < sessions.length; i++) out.push(sessions[i].label)
+  return out.join(", ")
+}
+
 function publicSession(session, nowMs) {
   return {
     id: session.id,

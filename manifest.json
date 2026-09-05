@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ignibyte.stay-awake-sessions",
   "name": "Stay Awake Sessions",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "author": "Ignibyte",
   "description": "Hold the machine awake for a reason that ends by itself: a deadline, a running process, or any condition you can write as a command.",
   "homepage": "https://github.com/Ignibyte/omarchy-stay-awake-sessions",
@@ -29,8 +29,8 @@
       "graceSeconds": 15,
       "notify": true,
       "showWhenIdle": true,
-      "quickMinutes": "5, 15, 30",
-      "quickHours": "1, 2, 4",
+      "quickMinutes": "5, 15, 30, 45",
+      "quickHours": "1, 2, 4, 8",
       "showCountdown": true,
       "notifyOnStart": false,
       "icon": "󰅶"
@@ -50,14 +50,14 @@
         "key": "quickMinutes",
         "type": "string",
         "label": "Quick holds, in minutes",
-        "defaultValue": "5, 15, 30",
+        "defaultValue": "5, 15, 30, 45",
         "description": "Up to six, comma separated. One button each in the panel."
       },
       {
         "key": "quickHours",
         "type": "string",
         "label": "Quick holds, in hours",
-        "defaultValue": "1, 2, 4",
+        "defaultValue": "1, 2, 4, 8",
         "description": "Up to six, comma separated. One button each in the panel."
       },
       {
