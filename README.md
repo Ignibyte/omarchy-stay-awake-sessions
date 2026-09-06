@@ -177,18 +177,27 @@ keeps its deadline, an app, process or command hold starts its grace period
 again and ends the normal way if the thing it was waiting on is really gone,
 and a hold whose time ran out while the shell was away is reported as ended.
 The breadcrumb at `~/.local/state/omarchy/stay-awake-sessions/hold` carries the
-sessions along with the flag, and a new shell rebuilds them if the breadcrumb is
-less than fifteen minutes old, so a reboot or a plugin switched back on the
-next day starts clean. Disabling the plugin forgets them on the spot.
+sessions along with the flag. It is rewritten once a minute while anything is
+held and once more as the plugin unloads, and a new shell rebuilds the holds
+when it is less than fifteen minutes old, so a hold taken in the morning comes
+back after an afternoon restart while a reboot or a plugin switched back on
+the next day starts clean. Disabling the plugin forgets them on the spot.
 
 The flag itself is handled more carefully than the sessions. If the shell dies
 while a hold is live, the Stay Awake flag would outlive the process that took
 it, leaving a machine that never sleeps and nothing on screen to say why. A new
-shell first releases any hold it finds in the breadcrumb whose shell is gone,
-and only then rebuilds the sessions, which take the flag again through the
-ordinary path. Recovery of the flag only ever releases: after a crash there is
-no way to tell a flag you set by hand from one a dead hold left switched on, and
-of the two possible mistakes, a machine that never sleeps is the worse one.
+shell that finds a hold in the breadcrumb and sessions to rebuild adopts the
+flag as its own; one with nothing to rebuild releases it. Recovery after a
+crash only ever releases: there is no way to tell a flag you set by hand from
+one a dead hold left switched on, and of the two possible mistakes, a machine
+that never sleeps is the worse one. After a plugin reload the breadcrumb was
+written by the same shell moments earlier, so what it recorded as your own
+setting is trusted and given back.
+
+The shell reloads every plugin, its own idle service included, whenever a file
+in any local plugin changes, and it does so from the components it already
+compiled, so a code change still needs `omarchy-restart-shell`. Holds survive
+that reload too.
 
 ## From the command line without the wrapper
 

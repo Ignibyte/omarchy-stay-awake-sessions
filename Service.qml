@@ -89,6 +89,12 @@ Item {
   property var pendingRecovery: null
   property string pendingStatePayload: ""
   property bool hasPendingStatePayload: false
+  // Rewritten once a minute while anything is held, so the breadcrumb's age
+  // says how long the shell that wrote it has been gone, not how long ago a
+  // hold last changed. Without this a hold taken in the morning was judged
+  // stale by the first restart after lunch.
+  property double lastPersistAt: 0
+  readonly property int heartbeatMs: 60000
 
 
   // ------------------------------------------------------------- sessions
@@ -290,19 +296,25 @@ Item {
   // No parameters on purpose: a parameter that shadows a property of the same
   // name on this object silently resolves to the property, and QML gives no
   // warning. Reading the state straight off `root` cannot go wrong that way.
-  function persistState() {
-    var payload = JSON.stringify({
-      holding: !!root.holdingIdle,
-      restoreTo: !!root.userStayAwake,
+  function breadcrumbText(sessions, holdingFlag, restoreTo, suppressed) {
+    return JSON.stringify({
+      holding: holdingFlag,
+      restoreTo: restoreTo,
       shellPid: Quickshell.processId,
       savedAt: Date.now(),
-      sessions: SessionModel.persistableSessions(root.sessions),
+      sessions: sessions,
       screensaver: {
-        suppressed: !!root.suppressingScreensaver,
+        suppressed: suppressed,
         mode: root.standingScreensaverOff ? "standing" : "session",
         original: root.savedScreensaverSeconds
       }
     })
+  }
+
+  function persistState() {
+    root.lastPersistAt = Date.now()
+    var payload = root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
+      !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver)
     // Setting `running` on a Process that is already running does nothing, and
     // the replaced command is simply lost — so two state changes in quick
     // succession would leave the breadcrumb holding whichever one happened to
@@ -314,6 +326,12 @@ Item {
       return
     }
     root.writeState(payload)
+  }
+
+  function heartbeat() {
+    if (root.sessions.length === 0) return
+    if (Date.now() - root.lastPersistAt < root.heartbeatMs) return
+    root.persistState()
   }
 
   function writeState(payload) {
@@ -337,8 +355,14 @@ Item {
   // are rebuilt and take the levers again through the ordinary path, which
   // records the flag as it stands after the release, so nothing leaks.
   //
-  // A live shell pid means this is an ordinary plugin reload, where
-  // Component.onDestruction has already released the hold.
+  // A live shell pid means an ordinary plugin reload. The shell reloads every
+  // plugin when any local plugin changes, the first-party idle service among
+  // them, so the release made on the way out can vanish under that service's
+  // own reload and the flag comes back on from its file. A hold the last
+  // instance took is therefore a leak whenever the flag is still on now,
+  // dead shell or not; a flag already off needs nothing. On a reload the
+  // breadcrumb was written by this very process, so it is fresh by
+  // definition and its record of the user's own setting can be trusted.
   // The idle service reads its own flag file asynchronously at startup and
   // applies whatever it finds when the read lands. A hold taken before that
   // moment is overwritten by it, and the flip then reads as the user switching
@@ -354,11 +378,16 @@ Item {
     root.pendingRecovery = null
     var now = Date.now()
     var deadShell = Number(saved.shellPid) !== Quickshell.processId
-    var leftHolding = saved.holding === true && deadShell && !root.holdingIdle
+    var leftHolding = saved.holding === true && !root.holdingIdle
+    var priorOn = !deadShell && saved.restoreTo === true
+    root.log("recovering after a shell " + (deadShell ? "restart" : "reload") + ": the breadcrumb "
+      + (saved.holding === true ? "held" : "did not hold") + " the flag, the flag is "
+      + (root.idleService.stayAwake === true ? "on" : "off") + ", "
+      + (Array.isArray(saved.sessions) ? saved.sessions.length : 0) + " saved")
 
     recoverScreensaver(saved.screensaver)
 
-    var restored = SessionModel.restoreSessions(saved.sessions, saved.savedAt, now, defaults())
+    var restored = SessionModel.restoreSessions(saved.sessions, deadShell ? saved.savedAt : now, now, defaults())
     var keeping = !restored.stale && restored.sessions.length > 0 && root.sessions.length === 0
     var wantsIdle = keeping && SessionModel.anyHolds(restored.sessions, "idle")
 
@@ -369,8 +398,8 @@ Item {
       // it also watches, and two writes a millisecond apart make it read its
       // own file mid-flight and flip the flag under us. The user's setting is
       // taken as off, exactly what a release would have recorded.
-      root.log("adopting the idle hold left by a shell that is gone, for the holds being kept")
-      root.userStayAwake = false
+      root.log("adopting the idle hold left by the last instance, for the holds being kept")
+      root.userStayAwake = priorOn
       root.holdingIdle = true
       root.idleHeldAt = now
       root.reassertedIdle = false
@@ -379,9 +408,10 @@ Item {
       root.applyingIdleHold = false
       root.persistState()
     } else if (leftHolding) {
-      root.log("releasing an idle hold left behind by a shell that is gone")
+      root.log(priorOn ? "giving the idle flag back to the user after the last instance's hold"
+        : "releasing an idle hold left behind by the last instance")
       root.applyingIdleHold = true
-      root.idleService.setIdleEnabled(true)
+      root.idleService.setIdleEnabled(!priorOn)
       root.applyingIdleHold = false
       root.persistState()
     }
@@ -630,7 +660,10 @@ Item {
     interval: 1000
     repeat: true
     running: root.holding
-    onTriggered: root.expireDue()
+    onTriggered: {
+      root.expireDue()
+      root.heartbeat()
+    }
   }
 
   // ------------------------------------------------------------------ output
@@ -734,35 +767,37 @@ Item {
     }
   }
 
-  // The plugin's entry gone from the config the shell holds means this
-  // destruction is a disable or a remove, not a shell going down. The user
-  // switched the plugin off, so the holds go with it and must not be rebuilt
-  // when it is switched back on. Written through the FileView, synchronously,
-  // because a child process started this late may never get to run.
-  function forgetSessionsIfDisabled() {
-    if (!shell || !shell.shellConfig) return
+  // Whether the plugin's entry is still in the config the shell holds. Gone
+  // means this destruction is a disable or a remove, not a shell going down
+  // or a plugin reload.
+  function stillEnabled() {
+    if (!shell || !shell.shellConfig) return true
     var entry = SessionModel.settingsFor(shell.shellConfig, root.pluginId)
-    var stillEnabled = false
-    for (var key in entry) { stillEnabled = true; break }
-    if (stillEnabled) return
+    for (var key in entry) return true
+    return false
+  }
+
+  // The last word before the instance goes. Switched off by the user, the
+  // holds go with it and must not be rebuilt when it is switched back on.
+  // Otherwise the breadcrumb is written again, seconds old, so a reload or a
+  // clean restart finds the holds however long ago they were taken. Written
+  // through the FileView, synchronously, because a child process started
+  // this late may never get to run.
+  function leaveBreadcrumb() {
     if (root.sessions.length === 0) return
+    if (root.stillEnabled()) {
+      root.log("leaving a breadcrumb with " + root.sessions.length + " held on the way out")
+      holdState.setText(root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
+        !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver) + "\n")
+      return
+    }
     root.log("plugin disabled with " + root.sessions.length + " held; forgetting them")
-    holdState.setText(JSON.stringify({
-      holding: false,
-      restoreTo: false,
-      shellPid: Quickshell.processId,
-      savedAt: Date.now(),
-      sessions: [],
-      screensaver: {
-        suppressed: !!root.suppressingScreensaver && root.standingScreensaverOff,
-        mode: root.standingScreensaverOff ? "standing" : "session",
-        original: root.savedScreensaverSeconds
-      }
-    }) + "\n")
+    holdState.setText(root.breadcrumbText([], false, false,
+      !!root.suppressingScreensaver && root.standingScreensaverOff) + "\n")
   }
 
   Component.onDestruction: {
-    forgetSessionsIfDisabled()
+    leaveBreadcrumb()
     // Leaving a lever held after the plugin is disabled would strand the
     // machine awake with nothing left to release it.
     if (root.holdingIdle && root.idleService) {
