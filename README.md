@@ -202,6 +202,18 @@ to the breadcrumb until it has read the old one and acted on it, so an
 instance unloaded again before that moment leaves the last good breadcrumb
 for the next.
 
+The breadcrumb also carries the boot it was written in. After a reboot the
+holds it names are let go and a flag it says was held is released, however
+quickly the machine came back; a machine that never sleeps because of a hold
+from before a reboot was the mistake to avoid. A hold started in the first
+moments after a restart is kept alongside the ones being brought back, and
+`stay-awake off` in those moments lets the pending ones go too. Disabling the
+plugin in those moments still forgets them and releases the flag. A sleep
+inhibitor left running by a shell that died abnormally is stopped by the
+next instance. And a screensaver timeout found sitting at the plugin's own
+sentinel with no record of it is taken as the standing switch, so the panel
+says "off" and the switch can put it back.
+
 ## From the command line without the wrapper
 
 The plugin registers a `stayawake` IPC target:

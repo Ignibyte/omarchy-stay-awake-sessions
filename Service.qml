@@ -103,6 +103,14 @@ Item {
   // leave nothing for the next one to rebuild. Set once the breadcrumb has
   // been read and acted on, or found missing.
   property bool recovered: false
+  // One write per turn of the event loop: a hold's start or end changes
+  // several things in a row, and the breadcrumb should carry the state at
+  // the end of that, never a half of it.
+  property bool persistQueued: false
+  // This boot. A breadcrumb from before a reboot is never taken for a live
+  // shell's, however the pids compare, and a reboot lets go of the holds it
+  // interrupted instead of bringing back a machine that never sleeps.
+  property string bootId: ""
 
 
   // ------------------------------------------------------------- sessions
@@ -160,6 +168,25 @@ Item {
   }
 
   function endAll(reason) {
+    // Before recovery has run, "off" means the holds the breadcrumb was about
+    // to bring back as much as any live ones: they are let go, and a flag it
+    // says was held is released.
+    if (root.pendingRecovery) {
+      var saved = root.pendingRecovery
+      var count = Array.isArray(saved.sessions) ? saved.sessions.length : 0
+      root.pendingRecovery = null
+      root.recovered = true
+      recoveryFallback.stop()
+      recoverScreensaver(saved.screensaver)
+      if (count > 0) root.log("let go of " + count + (count === 1 ? " hold" : " holds") + " a restart was about to bring back: " + reason)
+      if (saved.holding === true && root.idleService && !root.holdingIdle) {
+        root.applyingIdleHold = true
+        root.idleService.setIdleEnabled(true)
+        root.applyingIdleHold = false
+      }
+      root.persistState()
+      if (sessions.length === 0) return count > 0 ? "ended " + count : "none"
+    }
     if (sessions.length === 0) return "none"
     var removed = sessions.slice()
     sessions = []
@@ -178,7 +205,8 @@ Item {
   }
 
   function toggle() {
-    if (sessions.length > 0) return endAll("switched off")
+    var pending = root.pendingRecovery && Array.isArray(root.pendingRecovery.sessions) && root.pendingRecovery.sessions.length > 0
+    if (sessions.length > 0 || pending) return endAll("switched off")
     return start("for=" + root.defaultMinutes + "m")
   }
 
@@ -196,7 +224,7 @@ Item {
     // setting is not one a dead shell left switched on. Until recovery has
     // run, nothing is taken: the sessions that want the lever are either the
     // ones about to be rebuilt, or new ones that can wait the same beat.
-    if (root.pendingRecovery) { recoveryDelay.restart(); return }
+    if (root.pendingRecovery) { if (!recoveryDelay.running) recoveryDelay.start(); return }
 
     if (root.wantIdleHold && !root.holdingIdle) {
       root.userStayAwake = idle.stayAwake === true
@@ -304,11 +332,14 @@ Item {
   // No parameters on purpose: a parameter that shadows a property of the same
   // name on this object silently resolves to the property, and QML gives no
   // warning. Reading the state straight off `root` cannot go wrong that way.
-  function breadcrumbText(sessions, holdingFlag, restoreTo, suppressed) {
+  function breadcrumbText(sessions, holdingFlag, restoreTo, suppressed, clean) {
     return JSON.stringify({
       holding: holdingFlag,
       restoreTo: restoreTo,
       shellPid: Quickshell.processId,
+      bootId: root.bootId,
+      clean: clean === true,
+      inhibitorPid: sleepInhibitor.running ? sleepInhibitor.processId : 0,
       savedAt: Date.now(),
       sessions: sessions,
       screensaver: {
@@ -320,15 +351,20 @@ Item {
   }
 
   function persistState() {
+    if (!root.recovered || root.persistQueued) return
+    root.persistQueued = true
+    Qt.callLater(root.flushState)
+  }
+
+  function flushState() {
+    root.persistQueued = false
     if (!root.recovered) return
     root.lastPersistAt = Date.now()
     var payload = root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
-      !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver)
+      !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver, false)
     // Setting `running` on a Process that is already running does nothing, and
-    // the replaced command is simply lost — so two state changes in quick
-    // succession would leave the breadcrumb holding whichever one happened to
-    // win, which is how a session-scoped suppression came back as a standing
-    // one. Queue instead, and let the last write stand.
+    // the replaced command is simply lost, so a write that lands while one is
+    // in flight waits its turn, and the last one stands.
     if (stateWriter.running) {
       root.pendingStatePayload = payload
       root.hasPendingStatePayload = true
@@ -347,7 +383,7 @@ Item {
     // argv rather than an interpolated command line: the payload never has to
     // survive a round of shell quoting, and the directory is made on the way.
     stateWriter.command = ["bash", "-c",
-      'mkdir -p "$1" && printf "%s\\n" "$2" > "$1/hold"',
+      'mkdir -p "$1" && printf "%s\\n" "$2" > "$1/hold.tmp" && mv -f "$1/hold.tmp" "$1/hold"',
       "stay-awake-sessions", root.stateDir, payload]
     stateWriter.running = true
   }
@@ -380,64 +416,96 @@ Item {
   // reports undefined, which is not false, and proceeds as before.
   readonly property bool idleStateReady: !!idleService && idleService.stayAwakeStateLoaded !== false
 
-  function tryRecover() {
-    if (!root.pendingRecovery || !root.idleService || !root.idleStateReady) return
+  function tryRecover(force) {
+    if (!root.pendingRecovery) return
+    var idle = root.idleService
+    if (!force && (!idle || !root.idleStateReady)) return
+    if (root.bootId === "") root.bootId = String(bootIdFile.text() || "").trim()
 
     var saved = root.pendingRecovery
     root.pendingRecovery = null
     root.recovered = true
+    recoveryFallback.stop()
     var now = Date.now()
-    var deadShell = Number(saved.shellPid) !== Quickshell.processId
-    var leftHolding = saved.holding === true && !root.holdingIdle
-    var priorOn = !deadShell && saved.restoreTo === true
-    root.log("recovering after a shell " + (deadShell ? "restart" : "reload") + ": the breadcrumb "
-      + (saved.holding === true ? "held" : "did not hold") + " the flag, the flag is "
-      + (root.idleService.stayAwake === true ? "on" : "off") + ", "
-      + (Array.isArray(saved.sessions) ? saved.sessions.length : 0) + " saved")
+    var sameBoot = !saved.bootId || saved.bootId === root.bootId
+    var deadShell = !sameBoot || Number(saved.shellPid) !== Quickshell.processId
+    var flagOn = !!idle && idle.stayAwake === true
+    // The user's own setting is trusted only from an orderly exit; a crash
+    // leaves whatever the last asynchronous write said, which may be stale.
+    var priorOn = saved.clean === true && saved.restoreTo === true
+    var savedAt = !sameBoot ? 0 : (deadShell ? saved.savedAt : now)
+    var savedCount = Array.isArray(saved.sessions) ? saved.sessions.length : 0
+    root.log("recovering after a " + (!sameBoot ? "reboot" : (deadShell ? "shell restart" : "shell reload")) + ": the breadcrumb "
+      + (saved.holding === true ? "held" : "did not hold") + " the flag, the flag is " + (flagOn ? "on" : "off") + ", " + savedCount + " saved")
 
     recoverScreensaver(saved.screensaver)
+    if (deadShell) reapInhibitor(saved.inhibitorPid)
 
-    var restored = SessionModel.restoreSessions(saved.sessions, deadShell ? saved.savedAt : now, now, defaults())
-    var keeping = !restored.stale && restored.sessions.length > 0 && root.sessions.length === 0
-    var wantsIdle = keeping && SessionModel.anyHolds(restored.sessions, "idle")
+    var restored = SessionModel.restoreSessions(saved.sessions, savedAt, now, defaults())
+    var keeping = !restored.stale && restored.sessions.length > 0
+    var wantsIdle = keeping && SessionModel.anyHolds(restored.sessions.concat(root.sessions), "idle")
+    // A hold the last instance took is a leak whenever this one does not hold,
+    // and a flag found on while the kept holds want it is taken as ours too:
+    // a hold that was starting when the shell died leaves it exactly so.
+    var leftHolding = !root.holdingIdle && (saved.holding === true || (wantsIdle && flagOn && !priorOn))
 
-    if (leftHolding && wantsIdle) {
-      // The holds being kept want the flag on, and a dead shell left it on.
-      // Adopt it as this shell's own hold rather than release it and take it
-      // straight back: the idle service persists every change through a file
-      // it also watches, and two writes a millisecond apart make it read its
-      // own file mid-flight and flip the flag under us. The user's setting is
-      // taken as off, exactly what a release would have recorded.
+    if (idle && leftHolding && wantsIdle) {
       root.log("adopting the idle hold left by the last instance, for the holds being kept")
       root.userStayAwake = priorOn
       root.holdingIdle = true
       root.idleHeldAt = now
       root.reassertedIdle = false
       root.applyingIdleHold = true
-      root.idleService.setIdleEnabled(false)
+      idle.setIdleEnabled(false)
       root.applyingIdleHold = false
-      root.persistState()
-    } else if (leftHolding) {
+    } else if (idle && leftHolding) {
       root.log(priorOn ? "giving the idle flag back to the user after the last instance's hold"
         : "releasing an idle hold left behind by the last instance")
       root.applyingIdleHold = true
-      root.idleService.setIdleEnabled(!priorOn)
+      idle.setIdleEnabled(!priorOn)
       root.applyingIdleHold = false
-      root.persistState()
     }
 
-    if (restored.stale) {
-      root.log("not restoring holds from a breadcrumb older than the restore window")
-      root.persistState()
-      return
-    }
+    if (!sameBoot && savedCount > 0) root.log("a new boot: the " + savedCount + (savedCount === 1 ? " hold" : " holds") + " from before it are let go")
+    else if (restored.stale && savedCount > 0) root.log("not restoring holds from a breadcrumb older than the restore window")
     if (restored.expired.length > 0) finish(restored.expired, "the time was up while the shell was away")
-    if (!keeping) return
-    if (restored.nextId > root.nextSessionId) root.nextSessionId = restored.nextId
-    root.sessions = restored.sessions
-    root.log("kept " + restored.sessions.length + (restored.sessions.length === 1 ? " hold" : " holds")
-      + " across a shell " + (deadShell ? "restart" : "reload") + ": " + SessionModel.sessionLabels(restored.sessions))
-    Qt.callLater(root.checkConditions)
+    if (keeping) {
+      // Holds started in the moments before recovery stay; the restored ones
+      // join them, renumbered only where an id is already taken.
+      var merged = root.sessions.slice()
+      var nextId = Math.max(root.nextSessionId, restored.nextId)
+      for (var i = 0; i < restored.sessions.length; i++) {
+        var session = restored.sessions[i]
+        var taken = merged.some(function(m) { return m.id === session.id })
+        if (taken) { session.id = String(nextId); nextId += 1 }
+        merged.push(session)
+      }
+      root.nextSessionId = nextId
+      root.sessions = merged
+      root.log("kept " + restored.sessions.length + (restored.sessions.length === 1 ? " hold" : " holds")
+        + " across a shell " + (deadShell ? "restart" : "reload") + ": " + SessionModel.sessionLabels(restored.sessions))
+      Qt.callLater(root.checkConditions)
+    }
+    root.persistState()
+  }
+
+  // A sleep inhibitor is a child process, and a shell that dies abnormally
+  // leaves it running with nothing to release it. The next instance stops
+  // the one the breadcrumb names, after checking the pid is still ours.
+  function reapInhibitor(pid) {
+    var id = Number(pid)
+    if (!(id > 1)) return
+    reaper.command = ["bash", "-c", 'if grep -qa "Stay Awake Sessions" "/proc/$1/cmdline" 2>/dev/null; then kill "$1" && echo reaped; fi',
+      "stay-awake-sessions", String(Math.floor(id))]
+    reaper.running = true
+  }
+
+  Process {
+    id: reaper
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (String(text || "").trim() === "reaped") root.log("stopped a sleep inhibitor left running by the last instance")
+    }
   }
 
   // The screensaver splits from the idle flag here. A standing switch is a
@@ -447,7 +515,18 @@ Item {
   // timeout goes back, or the user's screensaver stays silently dead in
   // shell.json with nothing left to explain it.
   function recoverScreensaver(saver) {
-    if (!saver || saver.suppressed !== true) return
+    if (!saver || saver.suppressed !== true) {
+      // A timeout sitting at our own sentinel with no record of it is a
+      // suppression an earlier instance lost track of. Own it as the standing
+      // switch, so the panel tells the truth and the switch can put it back.
+      if (root.configuredScreensaverSeconds >= SessionModel.SCREENSAVER_SENTINEL_FLOOR && !root.suppressingScreensaver) {
+        root.log("the screensaver timeout was left at the sentinel with no record of it; taking it as the standing switch")
+        root.savedScreensaverSeconds = SessionModel.realScreensaverSeconds(0, saver ? saver.original : 0)
+        root.suppressingScreensaver = true
+        root.standingScreensaverOff = true
+      }
+      return
+    }
     var original = SessionModel.realScreensaverSeconds(0, saver.original)
 
     if (String(saver.mode) === "standing") {
@@ -485,6 +564,27 @@ Item {
   }
 
   FileView {
+    id: bootIdFile
+    path: "/proc/sys/kernel/random/boot_id"
+    blockLoading: true
+    printErrors: false
+    onLoaded: root.bootId = String(text() || "").trim()
+  }
+
+  // Should the idle service never report ready (disabled, or failed to
+  // load), the sessions are still recovered, without touching the flag.
+  Timer {
+    id: recoveryFallback
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (!root.pendingRecovery || root.recovered) return
+      root.log("the idle service has not reported ready; recovering the holds without touching the flag")
+      root.tryRecover(true)
+    }
+  }
+
+  FileView {
     id: holdState
     path: root.statePath
     atomicWrites: true
@@ -497,7 +597,10 @@ Item {
         root.pendingRecovery = null
       }
       if (!root.pendingRecovery) root.recovered = true
-      else if (root.idleStateReady) recoveryDelay.restart()
+      else {
+        recoveryFallback.restart()
+        if (root.idleStateReady) recoveryDelay.restart()
+      }
     }
     // No breadcrumb yet: nothing to recover, and nothing to protect.
     onLoadFailed: root.recovered = true
@@ -797,16 +900,28 @@ Item {
   // through the FileView, synchronously, because a child process started
   // this late may never get to run.
   function leaveBreadcrumb() {
-    if (root.sessions.length === 0) return
     if (root.stillEnabled()) {
-      root.log("leaving a breadcrumb with " + root.sessions.length + " held on the way out")
+      // Enabled: a recovered instance writes what it knows, holds or none, so
+      // no older breadcrumb outlives it; one that never recovered leaves the
+      // last good breadcrumb for the next.
+      if (!root.recovered) return
       holdState.setText(root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
-        !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver) + "\n")
+        !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver, true) + "\n")
       return
     }
-    root.log("plugin disabled with " + root.sessions.length + " held; forgetting them")
+    // Disabled or removed: the holds go, including ones a recovery that never
+    // ran was about to bring back, and a flag such a breadcrumb says was held
+    // is released here, while the idle service is still reachable.
+    var pending = root.pendingRecovery
+    var pendingCount = pending && Array.isArray(pending.sessions) ? pending.sessions.length : 0
+    if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; forgetting them")
     holdState.setText(root.breadcrumbText([], false, false,
-      !!root.suppressingScreensaver && root.standingScreensaverOff) + "\n")
+      !!root.suppressingScreensaver && root.standingScreensaverOff, true) + "\n")
+    if (!root.holdingIdle && pending && pending.holding === true && root.idleService) {
+      root.applyingIdleHold = true
+      root.idleService.setIdleEnabled(true)
+      root.applyingIdleHold = false
+    }
   }
 
   Component.onDestruction: {

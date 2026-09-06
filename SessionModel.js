@@ -434,16 +434,23 @@ function persistableSessions(sessions) {
 function restoreSessions(saved, savedAt, nowMs, defaults) {
   var out = { sessions: [], expired: [], nextId: 1, stale: false }
   if (!Array.isArray(saved) || saved.length === 0) return out
+  // A clock that stepped back a little since the write is tolerated; one
+  // that says the breadcrumb is from the future by more than five minutes
+  // is not trusted.
   var age = nowMs - Number(savedAt)
-  if (!(Number(savedAt) > 0) || age < 0 || age > RESTORE_WINDOW_MS) {
+  if (!(Number(savedAt) > 0) || age < -5 * 60 * 1000 || age > RESTORE_WINDOW_MS) {
     out.stale = true
     return out
   }
+  var usedIds = {}
   for (var i = 0; i < saved.length; i++) {
     var s = saved[i]
     if (!s || KINDS.indexOf(String(s.kind)) === -1) continue
+    var id = String(s.id || (i + 1))
+    while (usedIds[id]) id = String(Number(id) > 0 ? Number(id) + 1 : i + 1)
+    usedIds[id] = true
     var session = {
-      id: String(s.id || (i + 1)),
+      id: id,
       kind: String(s.kind),
       label: String(s.label || ""),
       scope: normalizeScope(s.scope, defaults.scope),

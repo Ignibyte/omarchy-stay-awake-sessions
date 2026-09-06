@@ -53,7 +53,10 @@ check("a stale breadcrumb rebuilds nothing", () => {
   assert.strictEqual(Model.restoreSessions(saved, now - 16 * 60000, now, defaults).stale, true)
   assert.strictEqual(Model.restoreSessions(saved, now - 14 * 60000, now, defaults).sessions.length, 1)
   assert.strictEqual(Model.restoreSessions(saved, undefined, now, defaults).stale, true, "no timestamp is no trust")
-  assert.strictEqual(Model.restoreSessions(saved, now + 60000, now, defaults).stale, true, "a clock that went backwards is no trust either")
+  assert.strictEqual(Model.restoreSessions(saved, now + 60000, now, defaults).stale, false, "a clock that stepped back a minute is tolerated")
+  assert.strictEqual(Model.restoreSessions(saved, now + 10 * 60000, now, defaults).stale, true, "a breadcrumb ten minutes in the future is no trust")
+  const dup = Model.restoreSessions([{ kind: "manual", id: "2", label: "a" }, { kind: "manual", label: "b" }, { kind: "manual", id: "2", label: "c" }], now - 1000, now, defaults)
+  assert.strictEqual(JSON.stringify(dup.sessions.map(s => s.id)), JSON.stringify(["2", "3", "4"]), "ids come back unique")
   // Objects made inside the sandbox have another realm's prototype, so compare the JSON.
   assert.strictEqual(JSON.stringify(Model.restoreSessions([], now, now, defaults)), JSON.stringify({ sessions: [], expired: [], nextId: 1, stale: false }))
   assert.strictEqual(Model.restoreSessions(undefined, now, now, defaults).sessions.length, 0)
