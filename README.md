@@ -197,7 +197,10 @@ setting is trusted and given back.
 The shell reloads every plugin, its own idle service included, whenever a file
 in any local plugin changes, and it does so from the components it already
 compiled, so a code change still needs `omarchy-restart-shell`. Holds survive
-that reload too.
+that reload too, and two reloads back to back: a new instance writes nothing
+to the breadcrumb until it has read the old one and acted on it, so an
+instance unloaded again before that moment leaves the last good breadcrumb
+for the next.
 
 ## From the command line without the wrapper
 

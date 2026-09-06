@@ -95,6 +95,14 @@ Item {
   // stale by the first restart after lunch.
   property double lastPersistAt: 0
   readonly property int heartbeatMs: 60000
+  // Until recovery has run, the breadcrumb on disk is the last instance's
+  // truth and this one must not touch it. A new instance's `sessions` is
+  // set during construction, which fires onSessionsChanged and would write
+  // an empty breadcrumb before the old one had even been read; an instance
+  // unloaded again a moment later (two reloads back to back) would then
+  // leave nothing for the next one to rebuild. Set once the breadcrumb has
+  // been read and acted on, or found missing.
+  property bool recovered: false
 
 
   // ------------------------------------------------------------- sessions
@@ -312,6 +320,7 @@ Item {
   }
 
   function persistState() {
+    if (!root.recovered) return
     root.lastPersistAt = Date.now()
     var payload = root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
       !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver)
@@ -376,6 +385,7 @@ Item {
 
     var saved = root.pendingRecovery
     root.pendingRecovery = null
+    root.recovered = true
     var now = Date.now()
     var deadShell = Number(saved.shellPid) !== Quickshell.processId
     var leftHolding = saved.holding === true && !root.holdingIdle
@@ -486,8 +496,11 @@ Item {
       } catch (error) {
         root.pendingRecovery = null
       }
-      if (root.pendingRecovery && root.idleStateReady) recoveryDelay.restart()
+      if (!root.pendingRecovery) root.recovered = true
+      else if (root.idleStateReady) recoveryDelay.restart()
     }
+    // No breadcrumb yet: nothing to recover, and nothing to protect.
+    onLoadFailed: root.recovered = true
   }
 
   onIdleServiceChanged: {
