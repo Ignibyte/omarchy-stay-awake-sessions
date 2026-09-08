@@ -246,8 +246,20 @@ Item {
 
   // Written through the shell's own mutator so the edit lands on the config the
   // shell currently holds, rather than racing whatever else is writing the file.
+  //
+  // The mutator round-trips through shell.json: it sets shellConfig in memory
+  // and persists it, and the config FileView's own change watcher then reloads
+  // that write, reloading every plugin a second time. A value already sitting
+  // at the target costs the same two reloads as a real change, so a recovery
+  // or teardown path that "restores" what is already restored (a second
+  // instance settling after a shell restart, a destroyed instance whose value
+  // another write already fixed) turns into another round of teardown and
+  // construction across the whole registry — the mechanism behind the
+  // restart storm that wedged the idle monitor on 2026-09-07. Skipping a
+  // no-op write closes that loop without changing any real transition.
   function writeScreensaverSeconds(value) {
     if (!shell || typeof shell.mutateShellConfig !== "function") return false
+    if (root.configuredScreensaverSeconds === value) return true
     shell.mutateShellConfig(function(copy) {
       if (!copy.idle || typeof copy.idle !== "object") copy.idle = {}
       copy.idle.screensaver = value
