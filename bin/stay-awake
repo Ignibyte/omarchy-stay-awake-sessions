@@ -93,8 +93,15 @@ case "$command_name" in
     ;;
   status)
     ipc status | jq -r '
-      (if .screensaverSwitch == "off" then "Screensaver switch: off (the screen still locks at \(.lockSeconds / 60 | floor)m)" else empty end),
-      if .holding | not then "Nothing is holding this machine awake."
+      (if .screensaverSwitch == "off" then
+         (if .screensaverLever == "idle-flag"
+          then "Screensaver switch: off (this shell keeps idle.screensaver to itself, so the switch holds the idle flag and the screen does not lock either)"
+          else "Screensaver switch: off (the screen still locks at \(.lockSeconds / 60 | floor)m)" end)
+       else empty end),
+      if .holding | not then
+        (if .blocksIdle
+         then "No sessions, but the screensaver switch is holding the idle flag."
+         else "Nothing is holding this machine awake." end)
       else
         "Holding: \(.count) session\(if .count == 1 then "" else "s" end)"
         + (if .screensaverOff and (.blocksIdle | not) then " · screensaver" else "" end)

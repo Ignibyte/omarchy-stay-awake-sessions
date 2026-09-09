@@ -114,7 +114,7 @@ stay-awake while --scope all -- ./bin/gate.sh --full-regression
 
 | Scope | Effect |
 |---|---|
-| `screen` | The screensaver only. The screen still locks on time |
+| `screen` | The screensaver only, where the shell allows it. See below |
 | `idle` (default) | The screensaver and the lock, through Omarchy's own Stay Awake flag |
 | `sleep` | Suspend and hibernate, through a logind `idle:sleep` inhibitor |
 | `all` | `idle` and `sleep` together |
@@ -127,6 +127,12 @@ screensaver on its own and leaves the lock firing on schedule:
 ```bash
 stay-awake while-process mpv --scope screen --label "Watching something"
 ```
+
+On Omarchy 4.0.3 and later that split is gone. The shell hands `shell.json` only
+to a plugin of kind `bar`, and this is a widget, so `idle.screensaver` is out of
+reach. A `screen` hold falls back to the idle flag there, which means the screen
+does not lock either. `stay-awake status` names the lever in use, and the plugin
+will not claim a suppression it could not apply.
 
 ## The screensaver switch
 
@@ -143,6 +149,12 @@ The switch persists across restarts, because it edits `idle.screensaver` in
 your `shell.json` and puts your own value back when you turn it on again. Your
 original timeout is remembered, and the plugin will never mistake its own
 suppression for your setting.
+
+Where the shell refuses that write — Omarchy 4.0.3 and later — the switch holds
+the idle flag instead, so the screen stops locking as well, and switching Stay
+Awake off at the stock indicator puts the switch back with it. The two share one
+lever there. `stay-awake status` says as much rather than promising a lock that
+still fires.
 
 ## Options
 
@@ -212,7 +224,10 @@ plugin in those moments still forgets them and releases the flag. A sleep
 inhibitor left running by a shell that died abnormally is stopped by the
 next instance. And a screensaver timeout found sitting at the plugin's own
 sentinel with no record of it is taken as the standing switch, so the panel
-says "off" and the switch can put it back.
+says "off" and the switch can put it back. The reverse is checked too: a
+breadcrumb that says a suppression was in force is believed only if the
+timeout still carries it, so a write the shell refused cannot come back as a
+suppression that never happened.
 
 ## From the command line without the wrapper
 

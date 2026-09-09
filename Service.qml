@@ -8,8 +8,9 @@ import "SessionModel.js" as SessionModel
 // each with a condition that decides when it is over, and drives two levers
 // while at least one of them is live:
 //
-//   idle  — the first-party omarchy.idle service, called in process, which is
-//           the same flag the stock Stay Awake indicator toggles.
+//   idle  — the flag the stock Stay Awake indicator toggles, taken through the
+//           first-party omarchy.idle service where the shell hands it over,
+//           and through `omarchy toggle idle` where it does not.
 //   sleep — a systemd-inhibit child holding an idle:sleep block for as long as
 //           it runs.
 //
@@ -27,8 +28,22 @@ Item {
   readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
   readonly property string evaluatorPath: sourceDir === "" ? "" : sourceDir + "/bin/eval-predicates"
 
-  readonly property var idleService: shell && typeof shell.serviceFor === "function"
-    ? shell.serviceFor("omarchy.idle") : null
+  // Omarchy 4.0.3 narrowed the plugin API. A first-party service is handed out
+  // only to a plugin of kind `bar` or to an Indicators clone (shell.qml's
+  // pluginFirstPartyServiceFor and createScopedPluginShell); a service +
+  // bar-widget plugin gets null from serviceFor and from firstPartyServiceFor
+  // alike. Both are still asked, so the in-process route comes back by itself
+  // if a later Omarchy grants it.
+  readonly property var hostIdleService: !shell ? null
+    : ((typeof shell.firstPartyServiceFor === "function"
+        ? shell.firstPartyServiceFor("omarchy.idle") : null)
+      || (typeof shell.serviceFor === "function" ? shell.serviceFor("omarchy.idle") : null))
+  // The flag is only a file, and `omarchy toggle idle` is its supported
+  // interface — the same one omarchy-update-stay-awake drives — so the lever is
+  // still reachable when the service is not. `flagIdle` stands in with the
+  // small surface the rest of this file asks of a service.
+  readonly property var idleService: hostIdleService || flagIdle
+  readonly property bool usingFlagLever: !hostIdleService
 
   readonly property var config: shell && shell.shellConfig
     ? SessionModel.settingsFor(shell.shellConfig, pluginId) : ({})
@@ -53,7 +68,12 @@ Item {
   onSessionsChanged: persistState()
 
   readonly property bool holding: sessions.length > 0
+  // A screensaver hold falls back to the idle flag when the shell will not let
+  // this plugin write idle.screensaver: it is then the only lever that stops
+  // the screensaver, and it stops the lock with it. Better a hold that is
+  // wider than asked and says so than a switch that does nothing.
   readonly property bool wantIdleHold: SessionModel.anyHolds(sessions, "idle")
+    || (wantScreensaverOff && screensaverWriteRefused)
   readonly property bool wantSleepHold: SessionModel.anyHolds(sessions, "sleep")
   readonly property bool wantScreensaverOff: standingScreensaverOff || SessionModel.anyHolds(sessions, "screen")
 
@@ -73,6 +93,9 @@ Item {
   property bool standingScreensaverOff: false
   property bool suppressingScreensaver: false
   property int savedScreensaverSeconds: 0
+  // Set once the shell has refused a write to idle.screensaver. This is what
+  // the host allows, not a state that toggles back, so it is never cleared.
+  property bool screensaverWriteRefused: false
   // Set around our own writes to the idle flag so the change we just made is
   // not read back as the user overriding us.
   property bool applyingIdleHold: false
@@ -260,27 +283,46 @@ Item {
   function writeScreensaverSeconds(value) {
     if (!shell || typeof shell.mutateShellConfig !== "function") return false
     if (root.configuredScreensaverSeconds === value) return true
-    shell.mutateShellConfig(function(copy) {
+    // The facade keeps the method and refuses the work: under 4.0.3
+    // `_mutateBarConfig` is gated on kind `bar`, so this returns false for a
+    // service + bar-widget plugin. Reporting that honestly is what keeps the
+    // caller from latching a suppression that never happened.
+    return shell.mutateShellConfig(function(copy) {
       if (!copy.idle || typeof copy.idle !== "object") copy.idle = {}
       copy.idle.screensaver = value
-    })
-    return true
+    }) !== false
   }
 
   function syncScreensaverHold() {
     if (!shell || typeof shell.mutateShellConfig !== "function") return
 
     if (root.wantScreensaverOff && !root.suppressingScreensaver) {
-      root.savedScreensaverSeconds = SessionModel.realScreensaverSeconds(
+      var saving = SessionModel.realScreensaverSeconds(
         root.configuredScreensaverSeconds, root.savedScreensaverSeconds)
+      // Nothing is claimed until the write lands. Latching first and writing
+      // afterwards is what left the panel reporting a suppression that was
+      // never applied, with the guard above making it permanent.
+      if (!root.writeScreensaverSeconds(root.screensaverSentinel)) {
+        if (!root.screensaverWriteRefused) {
+          root.screensaverWriteRefused = true
+          root.log("the shell will not let this plugin write idle.screensaver; holding the idle flag instead, which stops the lock with it")
+        }
+        root.persistState()
+        return
+      }
+      root.savedScreensaverSeconds = saving
       root.suppressingScreensaver = true
-      root.writeScreensaverSeconds(root.screensaverSentinel)
       root.log("screensaver off (was " + root.savedScreensaverSeconds + "s)")
       root.persistState()
     } else if (!root.wantScreensaverOff && root.suppressingScreensaver) {
       var restored = SessionModel.realScreensaverSeconds(0, root.savedScreensaverSeconds)
+      // A refused restore means the timeout really is still at the sentinel,
+      // so the suppression stands and the panel keeps saying so.
+      if (!root.writeScreensaverSeconds(restored)) {
+        root.log("the shell refused to put idle.screensaver back; it stands at " + root.configuredScreensaverSeconds + "s")
+        return
+      }
       root.suppressingScreensaver = false
-      root.writeScreensaverSeconds(restored)
       root.log("screensaver back on at " + restored + "s")
       root.persistState()
     }
@@ -337,6 +379,19 @@ Item {
         return
       }
       root.userStayAwake = false
+      // The flag is gone, so this instance no longer holds it. Recording that
+      // before the sessions end matters once the screensaver folds onto this
+      // lever: the standing switch would otherwise keep wantIdleHold true, no
+      // change would reach syncIdleHold, and the plugin would go on reporting
+      // a hold on a flag that is not there.
+      root.holdingIdle = false
+      // The stock indicator drives the same lever the screensaver switch has
+      // to borrow when the timeout is out of reach, so switching it off puts
+      // that switch back as well rather than leaving the two to fight.
+      if (root.screensaverWriteRefused && root.standingScreensaverOff) {
+        root.standingScreensaverOff = false
+        root.log("the screensaver switch goes back on with it: on this build the two share one lever")
+      }
       root.endAll("Stay Awake was switched off")
     }
   }
@@ -528,6 +583,66 @@ Item {
     }
   }
 
+  // ------------------------------------------------- the idle flag as a file
+
+  // Where Omarchy keeps the flag. The stock indicator, `omarchy toggle idle`
+  // and omarchy-update-stay-awake all mean this one file.
+  readonly property string indicatorsDir: Quickshell.env("HOME") + "/.local/state/omarchy/indicators"
+
+  // The stand-in for omarchy.idle. It carries only what the rest of this file
+  // asks of a service — `stayAwake`, `stayAwakeStateLoaded`, setIdleEnabled() —
+  // so every call site is unchanged whichever lever is in use.
+  QtObject {
+    id: flagIdle
+    property bool stayAwake: false
+    property bool stayAwakeStateLoaded: false
+    // The argument is idle *enabled*, so the flag is its inverse: enabling idle
+    // lets go of the flag, disabling idle takes it.
+    function setIdleEnabled(enabled) {
+      idleFlagWriter.command = ["omarchy-toggle-idle", enabled ? "allow-idle" : "stay-awake"]
+      idleFlagWriter.running = true
+    }
+  }
+
+  function refreshIdleFlag() {
+    if (!idleFlagProbe.running) idleFlagProbe.running = true
+  }
+
+  // Read the way the first-party service reads it: probe the file, and watch
+  // the directory rather than the file, so the flag appearing and disappearing
+  // both register. A flip from the stock indicator is noticed here too, which
+  // is what lets the "Stay Awake was switched off" path keep working.
+  Process {
+    id: idleFlagProbe
+    command: ["bash", "-c",
+      'mkdir -p "$1"; if [[ -f "$1/stay-awake" ]]; then echo yes; else echo no; fi',
+      "stay-awake-sessions", root.indicatorsDir]
+    stdout: SplitParser {
+      onRead: function(line) {
+        flagIdle.stayAwake = String(line).trim() === "yes"
+        flagIdle.stayAwakeStateLoaded = true
+      }
+    }
+  }
+
+  Process {
+    id: idleFlagWriter
+    // Read back rather than assumed: a write that did not land would otherwise
+    // leave the plugin reporting a hold it does not have, which is the failure
+    // that hid the 4.0.3 breakage for a morning.
+    onExited: root.refreshIdleFlag()
+  }
+
+  FileView {
+    id: idleFlagWatcher
+    path: root.indicatorsDir
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.refreshIdleFlag()
+  }
+
+  Component.onCompleted: root.refreshIdleFlag()
+
   // The screensaver splits from the idle flag here. A standing switch is a
   // preference and is meant to outlive the shell, so it is adopted rather than
   // undone — the plugin picks the lever back up and keeps owning it. A
@@ -551,7 +666,14 @@ Item {
 
     if (String(saver.mode) === "standing") {
       root.savedScreensaverSeconds = original
-      root.suppressingScreensaver = true
+      // The preference comes back either way, but the suppression is adopted
+      // only when the timeout really is still at the sentinel. Adopting it on
+      // the breadcrumb's word is what made a refused write permanent: it left
+      // `suppressing` true, and the guard in syncScreensaverHold then never
+      // tried again, across every reload.
+      root.suppressingScreensaver = root.configuredScreensaverSeconds >= SessionModel.SCREENSAVER_SENTINEL_FLOOR
+      // Assigned last: this is what flips wantScreensaverOff, and the handler
+      // it fires must already see whether the suppression is real.
       root.standingScreensaverOff = true
       return
     }
@@ -562,7 +684,10 @@ Item {
     // round trip is what the reordering above exists to avoid.
     if (keptBySession) {
       root.savedScreensaverSeconds = original
-      root.suppressingScreensaver = true
+      // Same rule as the standing branch: claim the suppression only if the
+      // timeout carries it. The sessions are assigned after this returns, and
+      // that is what asks for the lever again if it is not.
+      root.suppressingScreensaver = root.configuredScreensaverSeconds >= SessionModel.SCREENSAVER_SENTINEL_FLOOR
       return
     }
 
@@ -850,7 +975,10 @@ Item {
         ? root.savedScreensaverSeconds : root.configuredScreensaverSeconds,
       lockSeconds: root.lockSeconds,
       sleepInhibitorRunning: sleepInhibitor.running,
-      idleServiceReachable: !!root.idleService,
+      idleServiceReachable: !!root.hostIdleService,
+      idleLever: root.usingFlagLever ? "flag" : "service",
+      screensaverLever: root.screensaverWriteRefused ? "idle-flag" : "timeout",
+      holdingIdleFlag: root.holdingIdle,
       stayAwake: root.idleService ? root.idleService.stayAwake : null,
       restoreStayAwakeTo: root.holdingIdle ? root.userStayAwake : null,
       nextDeadlineMs: SessionModel.soonestRemainingMs(root.sessions, now),
