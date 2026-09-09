@@ -450,11 +450,19 @@ Item {
     root.log("recovering after a " + (!sameBoot ? "reboot" : (deadShell ? "shell restart" : "shell reload")) + ": the breadcrumb "
       + (saved.holding === true ? "held" : "did not hold") + " the flag, the flag is " + (flagOn ? "on" : "off") + ", " + savedCount + " saved")
 
-    recoverScreensaver(saved.screensaver)
-    if (deadShell) reapInhibitor(saved.inhibitorPid)
-
+    // The sessions are worked out before the screensaver is, because the answer
+    // for the screensaver depends on them. A session-scoped suppression whose
+    // session is coming back must not be restored first and suppressed again a
+    // moment later: the pair nets to nothing on disk, but each write is a
+    // config round-trip that reloads every plugin and rebuilds the idle
+    // service's monitor, and rebuilding it twice inside a few milliseconds is
+    // what leaves it silent.
     var restored = SessionModel.restoreSessions(saved.sessions, savedAt, now, defaults())
     var keeping = !restored.stale && restored.sessions.length > 0
+
+    recoverScreensaver(saved.screensaver, keeping && SessionModel.anyHolds(restored.sessions, "screen"))
+    if (deadShell) reapInhibitor(saved.inhibitorPid)
+
     var wantsIdle = keeping && SessionModel.anyHolds(restored.sessions.concat(root.sessions), "idle")
     // A hold the last instance took is a leak whenever this one does not hold,
     // and a flag found on while the kept holds want it is taken as ours too:
@@ -526,7 +534,7 @@ Item {
   // session-scoped suppression had a lifetime that died with the shell, so its
   // timeout goes back, or the user's screensaver stays silently dead in
   // shell.json with nothing left to explain it.
-  function recoverScreensaver(saver) {
+  function recoverScreensaver(saver, keptBySession) {
     if (!saver || saver.suppressed !== true) {
       // A timeout sitting at our own sentinel with no record of it is a
       // suppression an earlier instance lost track of. Own it as the standing
@@ -548,10 +556,18 @@ Item {
       return
     }
 
-    // Session-scoped, and this instance has no sessions: whether the shell died
-    // or the plugin merely reloaded, whatever justified the suppression is gone.
-    // Writing the original back is idempotent, so doing it in both cases costs
-    // nothing and closes the reload leak.
+    // Session-scoped, and a session that wants the lever is coming back with
+    // this recovery: the suppression carries straight over to it. Restoring the
+    // timeout here would only have it written back a moment later, and the
+    // round trip is what the reordering above exists to avoid.
+    if (keptBySession) {
+      root.savedScreensaverSeconds = original
+      root.suppressingScreensaver = true
+      return
+    }
+
+    // Session-scoped with nothing coming back: whether the shell died or the
+    // plugin merely reloaded, whatever justified the suppression is gone.
     root.log("restoring the screensaver timeout left raised with no session behind it")
     root.savedScreensaverSeconds = original
     root.suppressingScreensaver = false
