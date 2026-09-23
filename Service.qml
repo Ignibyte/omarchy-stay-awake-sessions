@@ -122,15 +122,14 @@ Item {
   // the holds back up instead of quietly dropping what the user asked for.
   //
   // A restored command hold runs its command again, so the breadcrumb is
-  // treated as code: bin/state-file reads and writes it, and only inside a
-  // directory of this user's that nobody else can write, never through a
-  // link. See the top of that script for the checks.
+  // treated as code: bin/state-file is the only thing that reads or writes
+  // it, only inside a directory of this user's that nobody else can write,
+  // and never through a link. See the top of that script for the checks.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/stay-awake-sessions"
-  readonly property string statePath: stateDir + "/hold"
-  // Set once bin/state-file has vouched for the directory and found the
-  // breadcrumb missing or sound, or has written it. Only then may the last
-  // word before the instance goes be written from this process by path.
-  property bool breadcrumbSafe: false
+  // Whether the breadcrumb is being kept: bin/state-file has vouched for the
+  // directory and found the breadcrumb missing or sound, or has just written
+  // it. Holds outlive the shell only while this is true.
+  property bool breadcrumbKept: false
   property var pendingRecovery: null
   property string pendingStatePayload: ""
   property bool hasPendingStatePayload: false
@@ -524,6 +523,9 @@ Item {
     var flagOn = !!idle && idle.stayAwake === true
     // The user's own setting is trusted only from an orderly exit; a crash
     // leaves whatever the last asynchronous write said, which may be stale.
+    // Since 0.6.0 every write is asynchronous, so only a breadcrumb an older
+    // version left on its way out still counts as orderly, and otherwise the
+    // flag is let go, the safer of the two mistakes.
     var priorOn = saved.clean === true && saved.restoreTo === true
     var savedAt = !sameBoot ? 0 : (deadShell ? saved.savedAt : now)
     var savedCount = Array.isArray(saved.sessions) ? saved.sessions.length : 0
@@ -735,12 +737,9 @@ Item {
       // Said when writes start failing, not on every write after that: a
       // directory that fails its checks fails them each minute a hold is live,
       // and the read at startup has already said why.
-      if (exitCode !== 0 && root.breadcrumbSafe)
+      if (exitCode !== 0 && root.breadcrumbKept)
         root.log("state write failed: " + (String(stateWriterErrors.text || "").trim() || "exit " + exitCode))
-      // A breadcrumb the helper has just put in place is a plain file of ours
-      // in a directory it has vouched for. After a failure nothing is known,
-      // so nothing is written by path until a write goes through again.
-      root.breadcrumbSafe = exitCode === 0
+      root.breadcrumbKept = exitCode === 0
       if (!root.hasPendingStatePayload) return
       var payload = root.pendingStatePayload
       root.hasPendingStatePayload = false
@@ -770,27 +769,18 @@ Item {
     }
   }
 
-  // Used only for the last word before the instance goes, which has to be
-  // written from this process (see leaveBreadcrumb). It never reads: a read
-  // here would follow a link, so reading goes through bin/state-file below.
-  FileView {
-    id: holdState
-    path: root.statePath
-    preload: false
-    atomicWrites: true
-    blockWrites: true
-    printErrors: false
-  }
-
   // The last instance's breadcrumb, through bin/state-file.
   Process {
     id: stateReader
     property bool answered: false
     stdout: StdioCollector { id: stateReaderOutput; waitForEnd: true }
     stderr: StdioCollector { id: stateReaderErrors; waitForEnd: true }
-    onExited: function(exitCode) {
+    onExited: function(exitCode, exitStatus) {
       stateReader.answered = true
-      root.takeBreadcrumb(exitCode, stateReaderOutput.text, stateReaderErrors.text)
+      // Killed by a signal, the helper reports the signal's number as its
+      // exit code, which could pass for one of its own answers.
+      if (exitStatus !== 0) root.takeBreadcrumb(-1, "", "bin/state-file was killed by signal " + exitCode)
+      else root.takeBreadcrumb(exitCode, stateReaderOutput.text, stateReaderErrors.text)
     }
     // A command that cannot start reports no exit at all, only that it is
     // not running; recovery would otherwise wait for it for ever.
@@ -813,16 +803,18 @@ Item {
   // bin/state-file's exit status: 0 the breadcrumb follows, 3 there is none
   // yet, 4 the directory cannot be trusted, 5 the breadcrumb cannot.
   function takeBreadcrumb(exitCode, text, errors) {
+    // Once per instance, whichever of the reader's two signals got here first.
+    if (root.recovered || root.pendingRecovery) return
     var why = String(errors || "").trim()
     if (exitCode === 0) {
-      root.breadcrumbSafe = true
+      root.breadcrumbKept = true
       try {
         root.pendingRecovery = JSON.parse(String(text || ""))
       } catch (error) {
         root.pendingRecovery = null
       }
     } else if (exitCode === 3) {
-      root.breadcrumbSafe = true
+      root.breadcrumbKept = true
     } else if (exitCode === 5) {
       root.log("ignoring the breadcrumb: " + why)
     } else {
@@ -835,8 +827,8 @@ Item {
     }
     // Nothing to recover, and nothing to protect.
     root.recovered = true
-    // A breadcrumb that could not be trusted is replaced now, by the helper,
-    // rather than left where the last write of this instance would meet it.
+    // A breadcrumb that could not be trusted is replaced now rather than left
+    // for the next shell to find.
     if (exitCode === 5) root.persistState()
   }
 
@@ -1058,7 +1050,7 @@ Item {
       sleepInhibitorRunning: sleepInhibitor.running,
       idleServiceReachable: !!root.hostIdleService,
       idleLever: root.usingFlagLever ? "flag" : "service",
-      holdsOutliveShell: root.breadcrumbSafe,
+      holdsOutliveShell: root.breadcrumbKept,
       screensaverLever: root.screensaverWriteRefused ? "idle-flag" : "timeout",
       holdingIdleFlag: root.holdingIdle,
       stayAwake: root.idleService ? root.idleService.stayAwake : null,
@@ -1131,37 +1123,21 @@ Item {
     return false
   }
 
-  // The last word before the instance goes. Switched off by the user, the
-  // holds go with it and must not be rebuilt when it is switched back on.
-  // Otherwise the breadcrumb is written again, seconds old, so a reload or a
-  // clean restart finds the holds however long ago they were taken. Written
-  // through the FileView, synchronously, because a child process started
-  // this late may never get to run.
+  // Nothing is written as the instance goes. bin/state-file has kept the
+  // breadcrumb current, on every change and once a minute while anything is
+  // held, and a write from here would have to go straight from this process
+  // by path, because a child started this late may never get to run.
   //
-  // That write goes by path, and Qt's atomic save follows a link sitting at
-  // its target, so it is made only while breadcrumbSafe holds: bin/state-file
-  // has found the directory to be this user's, with nobody else able to write
-  // it or any directory above it, and the breadcrumb missing or a plain file
-  // of theirs. A link there now could only be this user's own doing.
-  function leaveBreadcrumb() {
-    if (root.stillEnabled()) {
-      // Enabled: a recovered instance writes what it knows, holds or none, so
-      // no older breadcrumb outlives it; one that never recovered leaves the
-      // last good breadcrumb for the next.
-      if (!root.recovered || !root.breadcrumbSafe) return
-      holdState.setText(root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
-        !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver, true) + "\n")
-      return
-    }
-    // Disabled or removed: the holds go, including ones a recovery that never
-    // ran was about to bring back, and a flag such a breadcrumb says was held
-    // is released here, while the idle service is still reachable.
+  // Switched off by the user, a flag that a recovery which never ran says was
+  // held is released here, while the idle service is still reachable. The
+  // breadcrumb is left as it is, so holds switched off with the plugin come
+  // back if it is switched on again within the restore window. Omarchy 4.0.3
+  // and later cannot tell this instance a disable from a reload anyway.
+  function releaseOnDisable() {
+    if (root.stillEnabled()) return
     var pending = root.pendingRecovery
     var pendingCount = pending && Array.isArray(pending.sessions) ? pending.sessions.length : 0
-    if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; forgetting them")
-    if (root.breadcrumbSafe)
-      holdState.setText(root.breadcrumbText([], false, false,
-        !!root.suppressingScreensaver && root.standingScreensaverOff, true) + "\n")
+    if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; letting them go")
     if (!root.holdingIdle && pending && pending.holding === true && root.idleService) {
       root.applyingIdleHold = true
       root.idleService.setIdleEnabled(true)
@@ -1170,7 +1146,7 @@ Item {
   }
 
   Component.onDestruction: {
-    leaveBreadcrumb()
+    releaseOnDisable()
     // Leaving a lever held after the plugin is disabled would strand the
     // machine awake with nothing left to release it.
     if (root.holdingIdle && root.idleService) {

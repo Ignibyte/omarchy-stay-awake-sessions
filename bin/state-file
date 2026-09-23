@@ -7,14 +7,15 @@
 The breadcrumb carries the holds a restarted shell brings back, and a command
 hold that comes back runs its command again, so the file is handled as code:
 
-- DIR is made 0700 when missing, opened without following a link, and has to
-  be a directory of this user's; any group or other bits on it are cleared.
-  Everything after that happens relative to that open directory.
-- Every directory above DIR, on the path as written and as it resolves, has to
-  belong to this user or to root, and one that anybody else can write has to
-  be sticky. Nobody else can then swap DIR or anything in it, which is what
-  lets the plugin's own last write, made straight from the shell as it
-  unloads, trust the same path.
+- DIR is reached from / one directory at a time, each opened relative to the
+  last without following a link and checked on that open handle before the
+  walk goes on, so what is checked is what is used: it has to belong to this
+  user or to root, and one that anybody else can write has to be sticky. A
+  link on the way is followed only if it belongs to this user or to root, and
+  its target is walked the same way.
+- DIR itself is made 0700 when missing, cannot be a link, and has to be this
+  user's; any group or other bits on it are cleared. Everything after that
+  happens relative to it.
 - A write goes to a staging file with an unpredictable name, created
   exclusively and never through a link, checked again once written (a plain
   file of ours with one link, still under that name), synced, and renamed
@@ -42,6 +43,8 @@ MAX_BYTES = 1 << 20
 # A staging file is renamed within milliseconds of being made. One this old
 # was left by a writer killed partway, usually by the plugin unloading.
 STALE_STAGING_SECONDS = 3600
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+MAX_STEPS = 40
 
 
 class Refused(Exception):
@@ -58,43 +61,92 @@ def untrusted_breadcrumb(reason):
     return Refused(5, reason)
 
 
-def ancestors(path):
-    out = []
-    while True:
-        out.append(path)
-        parent = os.path.dirname(path)
-        if parent == path:
-            return out
-        path = parent
+def check_directory(fd, where, uid):
+    st = os.fstat(fd)
+    if st.st_uid not in (0, uid):
+        raise untrusted_directory(f"{where} belongs to uid {st.st_uid}")
+    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+        raise untrusted_directory(f"{where} can be written by others")
 
 
-def check_path(directory, uid):
-    parent = os.path.dirname(directory)
-    seen = set()
-    for path in ancestors(parent) + ancestors(os.path.realpath(parent)):
-        if path in seen:
-            continue
-        seen.add(path)
-        st = os.stat(path)
-        if st.st_uid not in (0, uid):
-            raise untrusted_directory(f"{path} belongs to uid {st.st_uid}")
-        if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
-            raise untrusted_directory(f"{path} can be written by others")
+def walk(parts, uid):
+    """Open the directory that `parts` name, from / down, checking each one on
+    its open handle before going on and making the ones that are missing."""
+    fd = os.open("/", DIRECTORY)
+    where = "/"
+    # Links followed and directories made. Past this the walk is going round.
+    steps = 0
+    pending = [part for part in parts if part not in ("", ".")]
+    try:
+        check_directory(fd, where, uid)
+        while pending:
+            name = pending.pop(0)
+            try:
+                child = os.open(name, DIRECTORY, dir_fd=fd)
+            except FileNotFoundError:
+                steps += 1
+                if steps > MAX_STEPS:
+                    raise untrusted_directory(f"{where} keeps changing under the walk")
+                try:
+                    os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                pending.insert(0, name)
+                continue
+            except OSError as error:
+                # With O_DIRECTORY a link can fail as ENOTDIR as well as ELOOP,
+                # so look at the entry itself.
+                if error.errno not in (errno.ELOOP, errno.ENOTDIR):
+                    raise
+                link = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISLNK(link.st_mode):
+                    raise
+                # Only a link this user or root put there is followed: in a
+                # sticky directory anyone may have left one.
+                if link.st_uid not in (0, uid):
+                    raise untrusted_directory(
+                        f"{os.path.join(where, name)} is a link belonging to uid {link.st_uid}")
+                steps += 1
+                if steps > MAX_STEPS:
+                    raise untrusted_directory(f"too many links on the way through {where}")
+                target = os.readlink(name, dir_fd=fd)
+                if target.startswith("/"):
+                    os.close(fd)
+                    fd = -1
+                    fd = os.open("/", DIRECTORY)
+                    where = "/"
+                    check_directory(fd, where, uid)
+                pending[0:0] = [part for part in target.split("/") if part not in ("", ".")]
+                continue
+            os.close(fd)
+            fd = child
+            where = os.path.normpath(os.path.join(where, name))
+            check_directory(fd, where, uid)
+        return fd, where
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
 
 
 def open_state_directory(directory, uid):
-    os.makedirs(os.path.dirname(directory), exist_ok=True)
-    check_path(directory, uid)
+    parent, name = os.path.split(directory.rstrip("/"))
+    if name in ("", ".", ".."):
+        raise Refused(1, f"{directory} does not name a directory")
+    pfd, _ = walk(parent.split("/"), uid)
     try:
-        os.mkdir(directory, 0o700)
-    except FileExistsError:
-        pass
-    try:
-        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise untrusted_directory(f"{directory} is not a directory of its own")
-        raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=pfd)
+        except FileExistsError:
+            pass
+        try:
+            dfd = os.open(name, DIRECTORY, dir_fd=pfd)
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise untrusted_directory(f"{directory} is not a directory of its own")
+            raise
+    finally:
+        os.close(pfd)
     try:
         st = os.fstat(dfd)
         if st.st_uid != uid:
@@ -192,7 +244,6 @@ def main(argv):
     if not os.path.isabs(directory):
         print("state-file: DIR has to be an absolute path", file=sys.stderr)
         return 1
-    directory = os.path.normpath(directory)
     uid = os.getuid()
     payload = b""
     if action == "write":

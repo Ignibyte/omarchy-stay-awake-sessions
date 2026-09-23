@@ -121,6 +121,38 @@ def a_shared_directory_above_is_refused(base):
         assert not os.path.exists(os.path.join(state, "hold"))
 
 
+def a_shared_directory_behind_a_second_link_is_refused(base):
+    # home/.local -> shared/local -> real/local: the shared directory is on
+    # neither the path as written nor the path it finally resolves to.
+    for path in ("home", "real/local"):
+        os.makedirs(os.path.join(base, path))
+    shared = os.path.join(base, "shared")
+    os.mkdir(shared)
+    os.chmod(shared, 0o777)
+    os.symlink(os.path.join(base, "real", "local"), os.path.join(shared, "local"))
+    os.symlink(os.path.join(shared, "local"), os.path.join(base, "home", ".local"))
+    state = os.path.join(base, "home", ".local", "stay-awake-sessions")
+    code, _, err = run("write", state, b'{"sessions":[]}\n')
+    assert code == 4 and "written by others" in err, (code, err)
+    assert os.listdir(os.path.join(base, "real", "local")) == []
+    assert run("read", state)[0] == 4
+
+
+def a_relative_link_resolves_as_the_kernel_would(base):
+    os.makedirs(os.path.join(base, "home"))
+    os.makedirs(os.path.join(base, "disk", "state"))
+    os.symlink("../disk/state", os.path.join(base, "home", "state"))
+    state = os.path.join(base, "home", "state", "stay-awake-sessions")
+    assert run("write", state, b'{"sessions":[]}\n')[0] == 0
+    assert os.path.isfile(os.path.join(base, "disk", "state", "stay-awake-sessions", "hold"))
+
+
+def a_link_loop_is_refused(base):
+    os.symlink("loop", os.path.join(base, "loop"))
+    code, _, err = run("write", os.path.join(base, "loop", "stay-awake-sessions"), b'{"sessions":[]}\n')
+    assert code == 4 and "too many links" in err, (code, err)
+
+
 def a_sticky_directory_above_is_fine(base):
     sticky = os.path.join(base, "sticky")
     os.mkdir(sticky)
@@ -191,6 +223,9 @@ check("a link at the old hold.tmp name is never written through", a_link_at_the_
 check("a state directory that is a link is refused", a_linked_directory_is_refused)
 check("a directory of ours that others could write is closed", a_loose_directory_of_ours_is_closed)
 check("a directory above that others can write is refused", a_shared_directory_above_is_refused)
+check("a shared directory behind a second link is refused", a_shared_directory_behind_a_second_link_is_refused)
+check("a relative link with .. resolves as the kernel would", a_relative_link_resolves_as_the_kernel_would)
+check("a link loop on the way is refused", a_link_loop_is_refused)
 check("a sticky directory above, like /tmp, is fine", a_sticky_directory_above_is_fine)
 check("a breadcrumb with other names or open to writes is ignored", a_breadcrumb_that_is_not_plainly_ours_is_ignored)
 check("a pipe, a huge file or a directory at hold is ignored", odd_things_at_hold_are_ignored)

@@ -190,22 +190,26 @@ keeps its deadline, an app, process or command hold starts its grace period
 again and ends the normal way if the thing it was waiting on is really gone,
 and a hold whose time ran out while the shell was away is reported as ended.
 The breadcrumb at `~/.local/state/omarchy/stay-awake-sessions/hold` carries the
-sessions along with the flag. It is rewritten once a minute while anything is
-held and once more as the plugin unloads, and a new shell rebuilds the holds
-when it is less than fifteen minutes old, so a hold taken in the morning comes
-back after an afternoon restart while a reboot or a plugin switched back on
-the next day starts clean. Disabling the plugin forgets them on the spot.
+sessions along with the flag. It is rewritten whenever the holds change and
+once a minute while anything is held, and a new shell rebuilds the holds when
+it is less than fifteen minutes old, so a hold taken in the morning comes back
+after an afternoon restart while a reboot or a plugin switched back on the
+next day starts clean. Disabling the plugin lets go of the flag at once; the
+holds it was keeping come back only if you switch it on again within those
+fifteen minutes.
 
 A command hold that comes back runs its command again, so the breadcrumb is
 handled as code, and `bin/state-file` is the only thing that reads or writes
-it. The directory is made `0700`, has to be yours, and is worked in through
-an open handle rather than by path. Every directory above it has to be yours
-or root's, and nobody else may be able to write to it. A write goes to a
-staging file with an unpredictable name, created fresh, and is then renamed
-into place. A read trusts only a plain file of yours. Nothing is read or
-written through a link. If the directory fails those checks, holds still
-work but do not outlive the shell. The journal says why, and so does
-`stay-awake status`.
+it. The helper walks down to the directory from `/` one directory at a time,
+checking each one as it opens it: each has to be yours or root's, and nobody
+else may be able to write to it unless it is sticky, like `/tmp`. A link on
+the way is followed only if it is yours or root's. The directory itself is
+made `0700`, has to be yours, and is worked in through that open handle
+rather than by path. A write goes to a staging file with an unpredictable
+name, created fresh, and is then renamed into place. A read trusts only a
+plain file of yours. Nothing is read or written through a link. If the
+directory fails those checks, holds still work but do not outlive the shell.
+The journal says why, and so does `stay-awake status`.
 
 The flag itself is handled more carefully than the sessions. If the shell dies
 while a hold is live, the Stay Awake flag would outlive the process that took
@@ -214,9 +218,10 @@ shell that finds a hold in the breadcrumb and sessions to rebuild adopts the
 flag as its own; one with nothing to rebuild releases it. Recovery after a
 crash only ever releases: there is no way to tell a flag you set by hand from
 one a dead hold left switched on, and of the two possible mistakes, a machine
-that never sleeps is the worse one. After a plugin reload the breadcrumb was
-written by the same shell moments earlier, so what it recorded as your own
-setting is trusted and given back.
+that never sleeps is the worse one. The same goes for your own setting: if you
+had switched Stay Awake on by hand before a hold, and the shell restarted or
+the plugin reloaded while the hold was live, the flag goes off with the last
+hold and you switch it back on.
 
 The shell reloads every plugin, its own idle service included, whenever a file
 in any local plugin changes, and it does so from the components it already
@@ -231,8 +236,7 @@ holds it names are let go and a flag it says was held is released, however
 quickly the machine came back; a machine that never sleeps because of a hold
 from before a reboot was the mistake to avoid. A hold started in the first
 moments after a restart is kept alongside the ones being brought back, and
-`stay-awake off` in those moments lets the pending ones go too. Disabling the
-plugin in those moments still forgets them and releases the flag. A sleep
+`stay-awake off` in those moments lets the pending ones go too. A sleep
 inhibitor left running by a shell that died abnormally is stopped by the
 next instance. And a screensaver timeout found sitting at the plugin's own
 sentinel with no record of it is taken as the standing switch, so the panel
