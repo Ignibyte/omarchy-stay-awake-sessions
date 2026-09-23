@@ -269,6 +269,10 @@ Item {
     // run, nothing is taken: the sessions that want the lever are either the
     // ones about to be rebuilt, or new ones that can wait the same beat.
     if (root.pendingRecovery) { if (!recoveryDelay.running) recoveryDelay.start(); return }
+    // Before the breadcrumb has even been read there is no knowing whether a
+    // dead shell left the flag on, so nothing is taken then either;
+    // takeBreadcrumb comes back here once it knows.
+    if (!root.recovered) return
 
     if (root.wantIdleHold && !root.holdingIdle) {
       root.userStayAwake = idle.stayAwake === true
@@ -798,6 +802,21 @@ Item {
     }
     stateReader.command = ["python3", root.stateFilePath, "read", root.stateDir]
     stateReader.running = true
+    stateReaderTimeout.start()
+  }
+
+  // Holds wait for the breadcrumb before they take the flag, so a read that
+  // hangs (a stalled filesystem) must not keep them waiting for good.
+  Timer {
+    id: stateReaderTimeout
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (stateReader.answered) return
+      stateReader.answered = true
+      stateReader.running = false
+      root.takeBreadcrumb(-1, "", "bin/state-file did not answer within ten seconds")
+    }
   }
 
   // bin/state-file's exit status: 0 the breadcrumb follows, 3 there is none
@@ -830,6 +849,8 @@ Item {
     // A breadcrumb that could not be trusted is replaced now rather than left
     // for the next shell to find.
     if (exitCode === 5) root.persistState()
+    // A hold started while the breadcrumb was being read has been waiting.
+    root.syncIdleHold()
   }
 
   onIdleServiceChanged: {
@@ -1137,7 +1158,7 @@ Item {
     if (root.stillEnabled()) return
     var pending = root.pendingRecovery
     var pendingCount = pending && Array.isArray(pending.sessions) ? pending.sessions.length : 0
-    if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; letting them go")
+    if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; letting go of the flag")
     if (!root.holdingIdle && pending && pending.holding === true && root.idleService) {
       root.applyingIdleHold = true
       root.idleService.setIdleEnabled(true)

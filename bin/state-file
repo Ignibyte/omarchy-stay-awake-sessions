@@ -43,6 +43,10 @@ MAX_BYTES = 1 << 20
 # A staging file is renamed within milliseconds of being made. One this old
 # was left by a writer killed partway, usually by the plugin unloading.
 STALE_STAGING_SECONDS = 3600
+# The directories on the way are only passed through, which takes search
+# permission and not read, so they are opened as paths. The state directory
+# itself is listed and synced, so it is opened for reading.
+PASSAGE = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_STEPS = 40
 
@@ -72,7 +76,7 @@ def check_directory(fd, where, uid):
 def walk(parts, uid):
     """Open the directory that `parts` name, from / down, checking each one on
     its open handle before going on and making the ones that are missing."""
-    fd = os.open("/", DIRECTORY)
+    fd = os.open("/", PASSAGE)
     where = "/"
     # Links followed and directories made. Past this the walk is going round.
     steps = 0
@@ -82,7 +86,7 @@ def walk(parts, uid):
         while pending:
             name = pending.pop(0)
             try:
-                child = os.open(name, DIRECTORY, dir_fd=fd)
+                child = os.open(name, PASSAGE, dir_fd=fd)
             except FileNotFoundError:
                 steps += 1
                 if steps > MAX_STEPS:
@@ -113,7 +117,7 @@ def walk(parts, uid):
                 if target.startswith("/"):
                     os.close(fd)
                     fd = -1
-                    fd = os.open("/", DIRECTORY)
+                    fd = os.open("/", PASSAGE)
                     where = "/"
                     check_directory(fd, where, uid)
                 pending[0:0] = [part for part in target.split("/") if part not in ("", ".")]

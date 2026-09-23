@@ -153,6 +153,20 @@ def a_link_loop_is_refused(base):
     assert code == 4 and "too many links" in err, (code, err)
 
 
+def a_directory_above_that_can_only_be_passed_through_is_fine(base):
+    # Like a hardened /home at 0711: search permission, no read.
+    passage = os.path.join(base, "passage")
+    os.mkdir(passage)
+    os.chmod(passage, 0o300)
+    try:
+        state = os.path.join(passage, "stay-awake-sessions")
+        code, _, err = run("write", state, b'{"sessions":[]}\n')
+        assert code == 0, (code, err)
+        assert run("read", state)[0] == 0
+    finally:
+        os.chmod(passage, 0o700)
+
+
 def a_sticky_directory_above_is_fine(base):
     sticky = os.path.join(base, "sticky")
     os.mkdir(sticky)
@@ -226,6 +240,7 @@ check("a directory above that others can write is refused", a_shared_directory_a
 check("a shared directory behind a second link is refused", a_shared_directory_behind_a_second_link_is_refused)
 check("a relative link with .. resolves as the kernel would", a_relative_link_resolves_as_the_kernel_would)
 check("a link loop on the way is refused", a_link_loop_is_refused)
+check("a directory above that can only be passed through is fine", a_directory_above_that_can_only_be_passed_through_is_fine)
 check("a sticky directory above, like /tmp, is fine", a_sticky_directory_above_is_fine)
 check("a breadcrumb with other names or open to writes is ignored", a_breadcrumb_that_is_not_plainly_ours_is_ignored)
 check("a pipe, a huge file or a directory at hold is ignored", odd_things_at_hold_are_ignored)
