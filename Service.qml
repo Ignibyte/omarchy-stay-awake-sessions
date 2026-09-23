@@ -34,6 +34,7 @@ Item {
   readonly property string sourceDir: manifest && manifest.__sourceDir
     ? String(manifest.__sourceDir) : SessionModel.dirFromUrl(Qt.resolvedUrl("."))
   readonly property string evaluatorPath: sourceDir === "" ? "" : sourceDir + "/bin/eval-predicates"
+  readonly property string stateFilePath: sourceDir === "" ? "" : sourceDir + "/bin/state-file"
 
   // Omarchy 4.0.3 narrowed the plugin API. A first-party service is handed out
   // only to a plugin of kind `bar` or to an Indicators clone (shell.qml's
@@ -119,8 +120,17 @@ Item {
   // it — leaving a machine that never sleeps and no session left to say why.
   // The same file carries the sessions themselves, so the next shell can pick
   // the holds back up instead of quietly dropping what the user asked for.
+  //
+  // A restored command hold runs its command again, so the breadcrumb is
+  // treated as code: bin/state-file reads and writes it, and only inside a
+  // directory of this user's that nobody else can write, never through a
+  // link. See the top of that script for the checks.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/stay-awake-sessions"
   readonly property string statePath: stateDir + "/hold"
+  // Set once bin/state-file has vouched for the directory and found the
+  // breadcrumb missing or sound, or has written it. Only then may the last
+  // word before the instance goes be written from this process by path.
+  property bool breadcrumbSafe: false
   property var pendingRecovery: null
   property string pendingStatePayload: ""
   property bool hasPendingStatePayload: false
@@ -459,12 +469,15 @@ Item {
   }
 
   function writeState(payload) {
-    // argv rather than an interpolated command line: the payload never has to
-    // survive a round of shell quoting, and the directory is made on the way.
-    stateWriter.command = ["bash", "-c",
-      'mkdir -p "$1" && printf "%s\\n" "$2" > "$1/hold.tmp" && mv -f "$1/hold.tmp" "$1/hold"',
-      "stay-awake-sessions", root.stateDir, payload]
+    if (root.stateFilePath === "") return
+    // The payload goes in on standard input, not on the command line, which
+    // anyone on the machine can read; the breadcrumb carries every hold's
+    // label and command.
+    stateWriter.command = ["python3", root.stateFilePath, "write", root.stateDir]
+    stateWriter.stdinEnabled = true
     stateWriter.running = true
+    stateWriter.write(payload + "\n")
+    stateWriter.stdinEnabled = false
   }
 
   // Recovery of the flag only ever releases, never re-enables. After a crash
@@ -653,7 +666,10 @@ Item {
     onFileChanged: root.refreshIdleFlag()
   }
 
-  Component.onCompleted: root.refreshIdleFlag()
+  Component.onCompleted: {
+    root.refreshIdleFlag()
+    root.readBreadcrumb()
+  }
 
   // The screensaver splits from the idle flag here. A standing switch is a
   // preference and is meant to outlive the shell, so it is adopted rather than
@@ -714,12 +730,17 @@ Item {
 
   Process {
     id: stateWriter
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (String(text || "").trim() !== "") root.log("state write: " + text)
-    }
+    stderr: StdioCollector { id: stateWriterErrors; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.log("state write failed, exit " + exitCode)
+      // Said when writes start failing, not on every write after that: a
+      // directory that fails its checks fails them each minute a hold is live,
+      // and the read at startup has already said why.
+      if (exitCode !== 0 && root.breadcrumbSafe)
+        root.log("state write failed: " + (String(stateWriterErrors.text || "").trim() || "exit " + exitCode))
+      // A breadcrumb the helper has just put in place is a plain file of ours
+      // in a directory it has vouched for. After a failure nothing is known,
+      // so nothing is written by path until a write goes through again.
+      root.breadcrumbSafe = exitCode === 0
       if (!root.hasPendingStatePayload) return
       var payload = root.pendingStatePayload
       root.hasPendingStatePayload = false
@@ -749,26 +770,74 @@ Item {
     }
   }
 
+  // Used only for the last word before the instance goes, which has to be
+  // written from this process (see leaveBreadcrumb). It never reads: a read
+  // here would follow a link, so reading goes through bin/state-file below.
   FileView {
     id: holdState
     path: root.statePath
+    preload: false
     atomicWrites: true
     blockWrites: true
     printErrors: false
-    onLoaded: {
+  }
+
+  // The last instance's breadcrumb, through bin/state-file.
+  Process {
+    id: stateReader
+    property bool answered: false
+    stdout: StdioCollector { id: stateReaderOutput; waitForEnd: true }
+    stderr: StdioCollector { id: stateReaderErrors; waitForEnd: true }
+    onExited: function(exitCode) {
+      stateReader.answered = true
+      root.takeBreadcrumb(exitCode, stateReaderOutput.text, stateReaderErrors.text)
+    }
+    // A command that cannot start reports no exit at all, only that it is
+    // not running; recovery would otherwise wait for it for ever.
+    onRunningChanged: {
+      if (stateReader.running || stateReader.answered) return
+      stateReader.answered = true
+      root.takeBreadcrumb(-1, "", "python3 could not be started")
+    }
+  }
+
+  function readBreadcrumb() {
+    if (root.stateFilePath === "") {
+      root.takeBreadcrumb(-1, "", "the plugin's own directory is unknown")
+      return
+    }
+    stateReader.command = ["python3", root.stateFilePath, "read", root.stateDir]
+    stateReader.running = true
+  }
+
+  // bin/state-file's exit status: 0 the breadcrumb follows, 3 there is none
+  // yet, 4 the directory cannot be trusted, 5 the breadcrumb cannot.
+  function takeBreadcrumb(exitCode, text, errors) {
+    var why = String(errors || "").trim()
+    if (exitCode === 0) {
+      root.breadcrumbSafe = true
       try {
-        root.pendingRecovery = JSON.parse(text())
+        root.pendingRecovery = JSON.parse(String(text || ""))
       } catch (error) {
         root.pendingRecovery = null
       }
-      if (!root.pendingRecovery) root.recovered = true
-      else {
-        recoveryFallback.restart()
-        if (root.idleStateReady) recoveryDelay.restart()
-      }
+    } else if (exitCode === 3) {
+      root.breadcrumbSafe = true
+    } else if (exitCode === 5) {
+      root.log("ignoring the breadcrumb: " + why)
+    } else {
+      root.log("holds will not outlive this shell: " + (why || "state-file exit " + exitCode))
     }
-    // No breadcrumb yet: nothing to recover, and nothing to protect.
-    onLoadFailed: root.recovered = true
+    if (root.pendingRecovery) {
+      recoveryFallback.restart()
+      if (root.idleStateReady) recoveryDelay.restart()
+      return
+    }
+    // Nothing to recover, and nothing to protect.
+    root.recovered = true
+    // A breadcrumb that could not be trusted is replaced now, by the helper,
+    // rather than left where the last write of this instance would meet it.
+    if (exitCode === 5) root.persistState()
   }
 
   onIdleServiceChanged: {
@@ -989,6 +1058,7 @@ Item {
       sleepInhibitorRunning: sleepInhibitor.running,
       idleServiceReachable: !!root.hostIdleService,
       idleLever: root.usingFlagLever ? "flag" : "service",
+      holdsOutliveShell: root.breadcrumbSafe,
       screensaverLever: root.screensaverWriteRefused ? "idle-flag" : "timeout",
       holdingIdleFlag: root.holdingIdle,
       stayAwake: root.idleService ? root.idleService.stayAwake : null,
@@ -1067,12 +1137,18 @@ Item {
   // clean restart finds the holds however long ago they were taken. Written
   // through the FileView, synchronously, because a child process started
   // this late may never get to run.
+  //
+  // That write goes by path, and Qt's atomic save follows a link sitting at
+  // its target, so it is made only while breadcrumbSafe holds: bin/state-file
+  // has found the directory to be this user's, with nobody else able to write
+  // it or any directory above it, and the breadcrumb missing or a plain file
+  // of theirs. A link there now could only be this user's own doing.
   function leaveBreadcrumb() {
     if (root.stillEnabled()) {
       // Enabled: a recovered instance writes what it knows, holds or none, so
       // no older breadcrumb outlives it; one that never recovered leaves the
       // last good breadcrumb for the next.
-      if (!root.recovered) return
+      if (!root.recovered || !root.breadcrumbSafe) return
       holdState.setText(root.breadcrumbText(SessionModel.persistableSessions(root.sessions),
         !!root.holdingIdle, !!root.userStayAwake, !!root.suppressingScreensaver, true) + "\n")
       return
@@ -1083,8 +1159,9 @@ Item {
     var pending = root.pendingRecovery
     var pendingCount = pending && Array.isArray(pending.sessions) ? pending.sessions.length : 0
     if (root.sessions.length > 0 || pendingCount > 0) root.log("plugin disabled with " + (root.sessions.length + pendingCount) + " held; forgetting them")
-    holdState.setText(root.breadcrumbText([], false, false,
-      !!root.suppressingScreensaver && root.standingScreensaverOff, true) + "\n")
+    if (root.breadcrumbSafe)
+      holdState.setText(root.breadcrumbText([], false, false,
+        !!root.suppressingScreensaver && root.standingScreensaverOff, true) + "\n")
     if (!root.holdingIdle && pending && pending.holding === true && root.idleService) {
       root.applyingIdleHold = true
       root.idleService.setIdleEnabled(true)

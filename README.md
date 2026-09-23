@@ -56,9 +56,10 @@ takes back out.
 ### Requirements
 
 Omarchy 4 (Quattro). Beyond what Omarchy already installs, it uses `bash`,
-`pgrep` (procps-ng), `systemd-inhibit` and `notify-send` (libnotify) — all
-present on a stock Omarchy box. The CLI wrapper also uses `jq`. The session
-logic in `SessionModel.js` runs under node: `node test/session-model-test.js`.
+`python3`, `pgrep` (procps-ng), `systemd-inhibit` and `notify-send`
+(libnotify) — all present on a stock Omarchy box. The CLI wrapper also uses
+`jq`. The session logic in `SessionModel.js` runs under node:
+`node test/session-model-test.js`.
 
 ## The bar widget
 
@@ -195,6 +196,17 @@ when it is less than fifteen minutes old, so a hold taken in the morning comes
 back after an afternoon restart while a reboot or a plugin switched back on
 the next day starts clean. Disabling the plugin forgets them on the spot.
 
+A command hold that comes back runs its command again, so the breadcrumb is
+handled as code, and `bin/state-file` is the only thing that reads or writes
+it. The directory is made `0700`, has to be yours, and is worked in through
+an open handle rather than by path. Every directory above it has to be yours
+or root's, and nobody else may be able to write to it. A write goes to a
+staging file with an unpredictable name, created fresh, and is then renamed
+into place. A read trusts only a plain file of yours. Nothing is read or
+written through a link. If the directory fails those checks, holds still
+work but do not outlive the shell. The journal says why, and so does
+`stay-awake status`.
+
 The flag itself is handled more carefully than the sessions. If the shell dies
 while a hold is live, the Stay Awake flag would outlive the process that took
 it, leaving a machine that never sleeps and nothing on screen to say why. A new
@@ -254,7 +266,9 @@ The plugin is a git checkout in `~/.config/omarchy/plugins/`. Saving a file is
 meant to reload the plugin in place, but that reload is known to get stuck;
 `omarchy-restart-shell` is the reliable way to load a change, and since 0.5.0
 the holds come back after it. `node test/session-model-test.js` runs the
-session logic without a shell.
+session logic without a shell, and `python3 test/state-file-test.py` plants
+the links and loose permissions the breadcrumb's reader and writer have to
+refuse.
 
 `SessionModel.js` holds every decision about durations, conditions and
 formatting as plain functions, so the logic can be read and exercised without a

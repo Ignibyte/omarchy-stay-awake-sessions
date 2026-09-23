@@ -93,6 +93,9 @@ case "$command_name" in
     ;;
   status)
     ipc status | jq -r '
+      (if .holdsOutliveShell == false
+       then "Holds would not outlive a shell restart right now: the breadcrumb could not be kept safely (the journal says why)."
+       else empty end),
       (if .screensaverSwitch == "off" then
          (if .screensaverLever == "idle-flag"
           then "Screensaver switch: off (this shell keeps idle.screensaver to itself, so the switch holds the idle flag and the screen does not lock either)"

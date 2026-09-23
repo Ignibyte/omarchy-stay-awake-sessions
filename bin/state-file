@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""The one reader and writer of the Stay Awake breadcrumb.
+
+    state-file read DIR     print DIR/hold
+    state-file write DIR    replace DIR/hold with what arrives on standard input
+
+The breadcrumb carries the holds a restarted shell brings back, and a command
+hold that comes back runs its command again, so the file is handled as code:
+
+- DIR is made 0700 when missing, opened without following a link, and has to
+  be a directory of this user's; any group or other bits on it are cleared.
+  Everything after that happens relative to that open directory.
+- Every directory above DIR, on the path as written and as it resolves, has to
+  belong to this user or to root, and one that anybody else can write has to
+  be sticky. Nobody else can then swap DIR or anything in it, which is what
+  lets the plugin's own last write, made straight from the shell as it
+  unloads, trust the same path.
+- A write goes to a staging file with an unpredictable name, created
+  exclusively and never through a link, checked again once written (a plain
+  file of ours with one link, still under that name), synced, and renamed
+  over `hold` within the directory. A link sitting at `hold` is replaced by
+  the rename, never followed.
+- A read opens `hold` without following a link and trusts it only as a plain
+  file of ours, with one link, that nobody else can write.
+
+Exit status: 0 done; 3 there is no breadcrumb yet; 4 the directory cannot be
+trusted, so nothing was read or written; 5 the breadcrumb cannot be trusted
+and was not read; 1 anything else. The reason goes to standard error.
+"""
+
+import errno
+import os
+import secrets
+import stat
+import sys
+import time
+
+HOLD = "hold"
+STAGING_PREFIX = ".hold-"
+# A breadcrumb is a few kilobytes. Anything this size is not one.
+MAX_BYTES = 1 << 20
+# A staging file is renamed within milliseconds of being made. One this old
+# was left by a writer killed partway, usually by the plugin unloading.
+STALE_STAGING_SECONDS = 3600
+
+
+class Refused(Exception):
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status = status
+
+
+def untrusted_directory(reason):
+    return Refused(4, reason)
+
+
+def untrusted_breadcrumb(reason):
+    return Refused(5, reason)
+
+
+def ancestors(path):
+    out = []
+    while True:
+        out.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            return out
+        path = parent
+
+
+def check_path(directory, uid):
+    parent = os.path.dirname(directory)
+    seen = set()
+    for path in ancestors(parent) + ancestors(os.path.realpath(parent)):
+        if path in seen:
+            continue
+        seen.add(path)
+        st = os.stat(path)
+        if st.st_uid not in (0, uid):
+            raise untrusted_directory(f"{path} belongs to uid {st.st_uid}")
+        if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+            raise untrusted_directory(f"{path} can be written by others")
+
+
+def open_state_directory(directory, uid):
+    os.makedirs(os.path.dirname(directory), exist_ok=True)
+    check_path(directory, uid)
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise untrusted_directory(f"{directory} is not a directory of its own")
+        raise
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != uid:
+            raise untrusted_directory(f"{directory} belongs to uid {st.st_uid}")
+        if st.st_mode & 0o077:
+            os.fchmod(dfd, 0o700)
+    except BaseException:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def check_breadcrumb(st, uid):
+    if not stat.S_ISREG(st.st_mode):
+        raise untrusted_breadcrumb("hold is not a plain file")
+    if st.st_uid != uid:
+        raise untrusted_breadcrumb(f"hold belongs to uid {st.st_uid}")
+    if st.st_nlink != 1:
+        raise untrusted_breadcrumb("hold has other names")
+    if st.st_mode & 0o022:
+        raise untrusted_breadcrumb("hold can be written by others")
+
+
+def read_breadcrumb(dfd, uid):
+    try:
+        # Non-blocking so that a pipe put in its place cannot hang the read.
+        fd = os.open(HOLD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except FileNotFoundError:
+        return 3
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise untrusted_breadcrumb("hold is a link")
+        raise
+    try:
+        check_breadcrumb(os.fstat(fd), uid)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as breadcrumb:
+        data = breadcrumb.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise untrusted_breadcrumb("hold is too large to be a breadcrumb")
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def sweep_staging(dfd, uid):
+    now = time.time()
+    with os.scandir(dfd) as entries:
+        names = [entry.name for entry in entries if entry.name.startswith(STAGING_PREFIX)]
+    for name in names:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if st.st_uid == uid and not stat.S_ISDIR(st.st_mode) and now - st.st_mtime > STALE_STAGING_SECONDS:
+                os.unlink(name, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+
+
+def write_breadcrumb(dfd, uid, payload):
+    sweep_staging(dfd, uid)
+    name = STAGING_PREFIX + secrets.token_hex(12)
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    placed = False
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        written = os.fstat(fd)
+        if not stat.S_ISREG(written.st_mode) or written.st_uid != uid or written.st_nlink != 1:
+            raise Refused(1, "the staging file changed while it was written")
+        named = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (written.st_dev, written.st_ino):
+            raise Refused(1, "the staging file was replaced while it was written")
+        os.replace(name, HOLD, src_dir_fd=dfd, dst_dir_fd=dfd)
+        placed = True
+        os.fsync(dfd)
+    finally:
+        os.close(fd)
+        if not placed:
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+    return 0
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] not in ("read", "write"):
+        print("usage: state-file read|write DIR", file=sys.stderr)
+        return 1
+    action, directory = argv[1], argv[2]
+    if not os.path.isabs(directory):
+        print("state-file: DIR has to be an absolute path", file=sys.stderr)
+        return 1
+    directory = os.path.normpath(directory)
+    uid = os.getuid()
+    payload = b""
+    if action == "write":
+        # Read in full before anything is checked, so a refusal never leaves
+        # the writer stuck on a pipe nobody drains.
+        payload = sys.stdin.buffer.read(MAX_BYTES + 1)
+        if len(payload) > MAX_BYTES:
+            print("state-file: the breadcrumb is too large", file=sys.stderr)
+            return 1
+        if not payload.strip():
+            print("state-file: nothing to write", file=sys.stderr)
+            return 1
+    try:
+        dfd = open_state_directory(directory, uid)
+        try:
+            if action == "read":
+                return read_breadcrumb(dfd, uid)
+            return write_breadcrumb(dfd, uid, payload)
+        finally:
+            os.close(dfd)
+    except Refused as refusal:
+        print(f"state-file: {refusal}", file=sys.stderr)
+        return refusal.status
+    except OSError as error:
+        print(f"state-file: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
