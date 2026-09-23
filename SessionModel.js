@@ -20,6 +20,15 @@ function pad2(n) {
   return n < 10 ? "0" + n : String(n)
 }
 
+// A local path from what Qt.resolvedUrl gives back for a directory.
+function dirFromUrl(url) {
+  var text = String(url || "")
+  if (text.indexOf("file://") === 0) text = text.slice(7)
+  try { text = decodeURIComponent(text) } catch (error) { /* leave it as it came */ }
+  while (text.length > 1 && text.charAt(text.length - 1) === "/") text = text.slice(0, -1)
+  return text
+}
+
 // "90" and "90m" are minutes, "2h", "1h30m", "45s", "1h30m10s" all work.
 function parseDurationMs(text) {
   var s = String(text || "").trim().toLowerCase()
@@ -378,12 +387,14 @@ function tooltip(sessions, nowMs) {
 }
 
 // A plugin that is both a service and a bar widget has one entry in
-// shell.json, and it can be in either place. Read whichever exists.
+// shell.json, and it can be in either place. Read whichever exists. The config
+// may be the whole of shell.json (Omarchy up to 4.0.2) or only its `bar` half
+// (4.0.3), which can hold only the bar's entry.
 function settingsFor(shellConfig, pluginId) {
   var id = String(pluginId || "")
   if (!shellConfig || typeof shellConfig !== "object") return {}
 
-  var bar = shellConfig.bar
+  var bar = shellConfig.bar && typeof shellConfig.bar === "object" ? shellConfig.bar : shellConfig
   if (bar && typeof bar === "object" && bar.layout && typeof bar.layout === "object") {
     var sections = ["left", "center", "right"]
     for (var s = 0; s < sections.length; s++) {

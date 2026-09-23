@@ -80,4 +80,22 @@ check("damaged entries are skipped and labels are filled in", () => {
   assert.strictEqual(restored.nextId, 9)
 })
 
+check("settings are found in the whole config and in its bar half", () => {
+  const entry = { id: "ignibyte.stay-awake-sessions", defaultMinutes: 25 }
+  const bar = { layout: { left: [], center: [{ id: "omarchy.clock" }], right: [entry] } }
+  assert.strictEqual(Model.settingsFor({ bar: bar }, entry.id).defaultMinutes, 25, "the whole of shell.json, up to 4.0.2")
+  assert.strictEqual(Model.settingsFor(bar, entry.id).defaultMinutes, 25, "the bar half, from 4.0.3")
+  assert.strictEqual(Model.settingsFor({ plugins: [entry] }, entry.id).defaultMinutes, 25, "the plugins list")
+  assert.strictEqual(JSON.stringify(Model.settingsFor(bar, "someone.else")), "{}")
+  assert.strictEqual(JSON.stringify(Model.settingsFor(null, entry.id)), "{}")
+})
+
+check("the plugin's directory comes back as a local path", () => {
+  assert.strictEqual(Model.dirFromUrl("file:///home/me/.config/omarchy/plugins/ignibyte.stay-awake-sessions/"),
+    "/home/me/.config/omarchy/plugins/ignibyte.stay-awake-sessions")
+  assert.strictEqual(Model.dirFromUrl("file:///home/me/My%20Plugins/x/"), "/home/me/My Plugins/x")
+  assert.strictEqual(Model.dirFromUrl("file:///"), "/")
+  assert.strictEqual(Model.dirFromUrl(""), "")
+})
+
 console.log(passed + " checks passed")

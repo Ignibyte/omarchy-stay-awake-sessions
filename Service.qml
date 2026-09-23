@@ -25,7 +25,14 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "ignibyte.stay-awake-sessions"
-  readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
+  // Where this plugin's own files are. Omarchy up to 4.0.2 stamped the path
+  // onto the manifest; 4.0.3 strips it from the copy a third-party plugin is
+  // handed, which left the condition checker without a path and every process
+  // or command hold with nothing to end it. The fallback asks QML where this
+  // very file sits, which is the same directory and needs nothing from the
+  // shell.
+  readonly property string sourceDir: manifest && manifest.__sourceDir
+    ? String(manifest.__sourceDir) : SessionModel.dirFromUrl(Qt.resolvedUrl("."))
   readonly property string evaluatorPath: sourceDir === "" ? "" : sourceDir + "/bin/eval-predicates"
 
   // Omarchy 4.0.3 narrowed the plugin API. A first-party service is handed out
@@ -45,8 +52,13 @@ Item {
   readonly property var idleService: hostIdleService || flagIdle
   readonly property bool usingFlagLever: !hostIdleService
 
-  readonly property var config: shell && shell.shellConfig
-    ? SessionModel.settingsFor(shell.shellConfig, pluginId) : ({})
+  // Settings live on the bar widget's entry in shell.json. Omarchy up to 4.0.2
+  // injected the shell itself, with the whole config on `shellConfig`; 4.0.3
+  // injects a capability-scoped API that carries only the bar half of it, as
+  // `barConfig`, kept current as shell.json changes. Either shape finds the
+  // entry.
+  readonly property var config: !shell ? ({})
+    : SessionModel.settingsFor(shell.shellConfig ? shell.shellConfig : shell.barConfig, pluginId)
   readonly property int defaultMinutes: SessionModel.clampInt(config.defaultMinutes, 1, 1440, 60)
   readonly property string defaultScope: SessionModel.normalizeScope(config.defaultScope, "idle")
   readonly property int pollSeconds: SessionModel.clampInt(config.pollSeconds, 1, 300, 5)
